@@ -1,0 +1,33 @@
+# Simplified Dockerfile for emulator with agent
+FROM budtmo/docker-android:latest
+
+# Set working directory
+WORKDIR /app
+
+# Install Node.js using the method that works with this base image
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl ca-certificates gnupg && \
+    curl -fsSL https://deb.nodesource.com/setup_18.x | bash - && \
+    apt-get install -y nodejs && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy agent files
+COPY agent/package.json agent/tsconfig.json ./
+COPY agent/src ./src
+
+# Install dependencies and build
+RUN npm install && npm run build
+
+# Create entrypoint that starts agent after emulator is ready
+RUN echo '#!/bin/bash\n\
+echo "Waiting for emulator to be ready..."\n\
+sleep 60\n\
+echo "Starting WhatsApp agent..."\n\
+cd /app && node dist/index.js\n\
+' > /start-agent.sh && chmod +x /start-agent.sh
+
+# Keep original entrypoint for emulator, agent will start separately
+CMD ["/start-agent.sh"]
+
+

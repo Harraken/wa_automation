@@ -1,0 +1,173 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ProvisionState {
+  PENDING
+  BUYING_NUMBER
+  SPAWNING_CONTAINER
+  LAUNCHING_WHATSAPP
+  ENTERING_PHONE
+  SETTING_UP_PROFILE
+  WAITING_OTP
+  INJECTING_OTP
+  COMPLETING_PROFILE    // After OTP, handling profile info, permissions, etc.
+  TESTING_DEEPLINK      // Testing message sending via deeplink
+  CREATING_SNAPSHOT     // Creating Docker snapshot
+  SETTING_UP
+  LINKING_WEB
+  ACTIVE
+  FAILED
+  CANCELLED
+}
+
+enum MessageDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum MessageStatus {
+  PENDING
+  SENT
+  DELIVERED
+  READ
+  FAILED
+}
+
+model Provision {
+  id               String         @id @default(cuid())
+  requestIdSmsman  String?        @unique @map("request_id_smsman")
+  phone            String?
+  countryId        String?        @map("country_id")
+  applicationId    String?        @map("application_id")
+  state            ProvisionState @default(PENDING)
+  label            String?
+  metadata         Json?
+  linkToWeb        Boolean        @default(false) @map("link_to_web")
+  lastError        String?        @map("last_error")
+  createdAt        DateTime       @default(now()) @map("created_at")
+  updatedAt        DateTime       @updatedAt @map("updated_at")
+  
+  sessions         Session[]
+  otpLogs          OtpLog[]
+  
+  @@index([state])
+  @@index([phone])
+  @@map("provisions")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  provisionId  String   @map("provision_id")
+  containerId  String?  @unique @map("container_id")
+  streamUrl    String?  @map("stream_url")
+  vncPort      Int?     @map("vnc_port")
+  appiumPort   Int?     @map("appium_port")
+  isActive     Boolean  @default(true) @map("is_active")
+  linkedWeb    Boolean  @default(false) @map("linked_web")
+  webSessionId String?  @map("web_session_id")
+  agentToken   String?  @map("agent_token")
+  lastSeen     DateTime? @map("last_seen")
+  snapshotPath String?  @map("snapshot_path")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+  
+  provision    Provision @relation(fields: [provisionId], references: [id], onDelete: Cascade)
+  messages     Message[]
+  logs         SessionLog[]
+  
+  @@index([provisionId])
+  @@index([isActive])
+  @@map("sessions")
+}
+
+model Message {
+  id         String           @id @default(cuid())
+  sessionId  String           @map("session_id")
+  from       String
+  to         String
+  text       String
+  direction  MessageDirection
+  status     MessageStatus    @default(PENDING)
+  raw        Json?
+  externalId String?          @map("external_id")
+  createdAt  DateTime         @default(now()) @map("created_at")
+  updatedAt  DateTime         @updatedAt @map("updated_at")
+  
+  session    Session          @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  
+  @@index([sessionId])
+  @@index([direction])
+  @@index([createdAt])
+  @@map("messages")
+}
+
+model OtpLog {
+  id          String   @id @default(cuid())
+  provisionId String   @map("provision_id")
+  rawSms      String   @map("raw_sms")
+  code        String?
+  parsedAt    DateTime @default(now()) @map("parsed_at")
+  
+  provision   Provision @relation(fields: [provisionId], references: [id], onDelete: Cascade)
+  
+  @@index([provisionId])
+  @@map("otp_logs")
+}
+
+model Admin {
+  id        String   @id @default(cuid())
+  username  String   @unique
+  password  String
+  createdAt DateTime @default(now()) @map("created_at")
+  
+  @@map("admins")
+}
+
+model PhoneNumber {
+  id            String   @id @default(cuid())
+  phone         String   @unique
+  requestId     String?  @unique @map("request_id")
+  provider      String   // 'SMS-MAN' or 'ONLINESIM'
+  countryId     String?  @map("country_id")
+  isUsed        Boolean  @default(false) @map("is_used")
+  provisionId   String?  @unique @map("provision_id")
+  usedAt        DateTime? @map("used_at")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+  
+  @@index([phone])
+  @@index([isUsed])
+  @@index([usedAt])
+  @@index([createdAt])
+  @@map("phone_numbers")
+}
+
+model SessionLog {
+  id        String   @id @default(cuid())
+  sessionId String   @map("session_id")
+  level     String   // 'info', 'warn', 'error', 'debug'
+  message   String
+  source    String?  // 'appium', 'automation', 'connection', 'provision', etc.
+  metadata  Json?    // Additional structured data
+  createdAt DateTime @default(now()) @map("created_at")
+  
+  session   Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  
+  @@index([sessionId])
+  @@index([createdAt])
+  @@index([level])
+  @@map("session_logs")
+}
+
+
+

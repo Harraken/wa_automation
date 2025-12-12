@@ -1,0 +1,168 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: wa-postgres
+    environment:
+      POSTGRES_USER: wa_user
+      POSTGRES_PASSWORD: wa_password
+      POSTGRES_DB: wa_provisioner
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - wa-provisioner-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wa_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: wa-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - wa-provisioner-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api
+      args:
+        CACHE_BUST: ${CACHE_BUST:-1}
+    container_name: wa-api
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://wa_user:wa_password@postgres:5432/wa_provisioner
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:-change_this_secret}
+      AGENT_AUTH_SECRET: ${AGENT_AUTH_SECRET:-change_this_agent_secret}
+      SMSMAN_TOKEN: ${SMSMAN_TOKEN}
+      SMSMAN_API_URL: https://api.sms-man.com/control
+      SMSMAN_POLL_INTERVAL_MS: 4000
+      SMSMAN_POLL_TIMEOUT_MS: 1800000
+      SMSMAN_DEFAULT_COUNTRY: "Canada"
+      ONLINESIM_API_KEY: 9FgbQsB5338nrQ6-16RAe62X-v22bQEWE-7ZMRed1L-Ba38bkG6hTQb8Yh
+      ONLINESIM_BASE_URL: https://onlinesim.io/api
+      ONLINESIM_POLL_INTERVAL_MS: 3000
+      ONLINESIM_POLL_TIMEOUT_MS: 1800000
+      ONLINESIM_DEFAULT_COUNTRY: "Canada"
+      EMULATOR_IMAGE: ${EMULATOR_IMAGE:-budtmo/docker-android}
+      STORAGE_PATH: /data/snapshots
+      DOCKER_NETWORK: wa-provisioner-network
+    ports:
+      - "3002:3000"
+    volumes:
+      - ./data/snapshots:/data/snapshots
+      - ./data/screenshots:/data/screenshots
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - wa-provisioner-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+      args:
+        CACHE_BUST: ${CACHE_BUST:-1}
+    container_name: wa-worker
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://wa_user:wa_password@postgres:5432/wa_provisioner
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:-change_this_secret}
+      AGENT_AUTH_SECRET: ${AGENT_AUTH_SECRET:-change_this_agent_secret}
+      SMSMAN_TOKEN: ${SMSMAN_TOKEN}
+      SMSMAN_API_URL: https://api.sms-man.com/control
+      SMSMAN_POLL_INTERVAL_MS: 4000
+      SMSMAN_POLL_TIMEOUT_MS: 1800000
+      SMSMAN_DEFAULT_COUNTRY: "Canada"
+      ONLINESIM_API_KEY: 9FgbQsB5338nrQ6-16RAe62X-v22bQEWE-7ZMRed1L-Ba38bkG6hTQb8Yh
+      ONLINESIM_BASE_URL: https://onlinesim.io/api
+      ONLINESIM_POLL_INTERVAL_MS: 3000
+      ONLINESIM_POLL_TIMEOUT_MS: 1800000
+      ONLINESIM_DEFAULT_COUNTRY: "Canada"
+      EMULATOR_IMAGE: ${EMULATOR_IMAGE:-budtmo/docker-android}
+      STORAGE_PATH: /data/snapshots
+      DOCKER_NETWORK: wa-provisioner-network
+    volumes:
+      - ./data/snapshots:/data/snapshots
+      - ./data/screenshots:/data/screenshots
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - wa-provisioner-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        CACHE_BUST: ${CACHE_BUST:-1}
+    container_name: wa-frontend
+    environment:
+      VITE_API_URL: http://localhost:3000
+      VITE_SOCKET_URL: http://localhost:3000
+    ports:
+      - "5173:80"
+    networks:
+      - wa-provisioner-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: wa-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    networks:
+      - wa-provisioner-network
+    depends_on:
+      - postgres
+    profiles:
+      - tools
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  wa-provisioner-network:
+    external: true
+    name: wa-provisioner-network
+
+
+
