@@ -28,7 +28,6 @@ router.get('/', authenticateJWT, async (_req: Request, res: Response) => {
 
     const sessionsWithLastMessage = sessions.map((session) => ({
       id: session.id,
-      provisionId: session.provisionId,
       phone: session.provision.phone,
       state: session.provision.state,
       isActive: session.isActive,
@@ -159,7 +158,7 @@ router.get('/:id/logs', authenticateJWT, async (req: Request, res: Response) => 
 
 /**
  * GET /sessions/:id/stream
- * Get stream URL with token
+ * Get stream URL; resolve VNC port from Docker if container is running (persistent sessions).
  */
 router.get('/:id/stream', authenticateJWT, async (req: Request, res: Response) => {
   try {
@@ -170,32 +169,54 @@ router.get('/:id/stream', authenticateJWT, async (req: Request, res: Response) =
       return;
     }
 
-    if (!session.streamUrl) {
+    let vncPort = session.vncPort ?? null;
+    let streamUrl = session.streamUrl ?? null;
+
+    // If session has a container, resolve current VNC port from Docker (container may have been restarted)
+    if (session.containerId) {
+      try {
+        const livePort = await dockerService.getContainerVncPort(session.containerId);
+        if (livePort != null) {
+          vncPort = livePort;
+          streamUrl = `http://localhost:${livePort}/vnc.html?resize=scale&autoconnect=1`;
+        }
+      } catch (e) {
+        // Keep DB values as fallback
+      }
+    }
+
+    if (!streamUrl && vncPort == null) {
       res.status(404).json({ error: 'Stream not available' });
       return;
     }
 
-    // Check if the websockify container is actually running
-    // @ts-ignore - TODO: Fix DockerService interface
-    const isWebsockifyRunning = await dockerService.isWebsockifyRunning(session.id);
-    if (!isWebsockifyRunning) {
-      res.status(503).json({ 
-        error: 'Stream container not running', 
-        message: 'Le conteneur VNC n\'est pas actif. La session a peut-être été arrêtée ou a échoué.',
-        sessionId: session.id
-      });
-      return;
-    }
-
-    // For now, return the stream URL directly
-    // In production, you'd generate a signed URL or token
     res.json({
-      streamUrl: session.streamUrl,
-      vncPort: session.vncPort,
+      streamUrl: streamUrl || (vncPort != null ? `http://localhost:${vncPort}/vnc.html?resize=scale&autoconnect=1` : null),
+      vncPort,
     });
   } catch (error) {
     logger.error({ error, sessionId: req.params.id }, 'Failed to get stream');
     res.status(500).json({ error: 'Failed to get stream' });
+  }
+});
+
+/**
+ * POST /sessions/:id/activate
+ * Mark session as active (persistent session: allows stream and keeps session usable).
+ */
+router.post('/:id/activate', authenticateJWT, async (req: Request, res: Response) => {
+  try {
+    const session = await sessionService.getSession(req.params.id);
+    if (!session) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+    await sessionService.activateSession(session.id);
+    logger.info({ sessionId: session.id }, 'Session activated');
+    res.json({ success: true, message: 'Session activée' });
+  } catch (error: any) {
+    logger.error({ error: error.message, sessionId: req.params.id }, 'Failed to activate session');
+    res.status(500).json({ error: 'Failed to activate session' });
   }
 });
 
@@ -344,4 +365,96 @@ router.delete('/:id', authenticateJWT, async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * POST /sessions/:id/capture-click/start
+ * Start capturing mouse clicks for learning button positions
+ */
+router.post('/:id/capture-click/start', authenticateJWT, async (req: Request, res: Response) => {
+  try {
+    const session = await sessionService.getSession(req.params.id);
+    if (!session) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    if (!session.containerId) {
+      res.status(400).json({ error: 'No container ID for this session' });
+      return;
+    }
+
+    const { buttonType = 'NEXT' } = req.body;
+    const { startClickCapture } = await import('../services/click-capture.service');
+    
+    const result = await startClickCapture(session.id, session.containerId, buttonType);
+    
+    if (result.success) {
+      res.json({ success: true, message: 'Click capture started' });
+    } else {
+      res.status(500).json({ error: result.error || 'Failed to start click capture' });
+    }
+  } catch (error: any) {
+    logger.error({ error: error.message, sessionId: req.params.id }, 'Failed to start click capture');
+    res.status(500).json({ error: 'Failed to start click capture' });
+  }
+});
+
+/**
+ * POST /sessions/:id/capture-click/stop
+ * Stop capturing mouse clicks
+ */
+router.post('/:id/capture-click/stop', authenticateJWT, async (req: Request, res: Response) => {
+  try {
+    const { stopClickCapture } = await import('../services/click-capture.service');
+    const result = await stopClickCapture(req.params.id);
+    res.json({ success: result.success });
+  } catch (error: any) {
+    logger.error({ error: error.message, sessionId: req.params.id }, 'Failed to stop click capture');
+    res.status(500).json({ error: 'Failed to stop click capture' });
+  }
+});
+
+/**
+ * POST /sessions/:id/capture-click/save
+ * Manually save click coordinates (alternative to automatic capture)
+ */
+router.post('/:id/capture-click/save', authenticateJWT, async (req: Request, res: Response) => {
+  try {
+    const { x, y, buttonType = 'NEXT' } = req.body;
+    
+    if (typeof x !== 'number' || typeof y !== 'number') {
+      res.status(400).json({ error: 'x and y must be numbers' });
+      return;
+    }
+
+    const { saveCapturedClick } = await import('../services/click-capture.service');
+    await saveCapturedClick(buttonType, x, y, req.params.id);
+    
+    res.json({ success: true, message: 'Click coordinates saved' });
+  } catch (error: any) {
+    logger.error({ error: error.message, sessionId: req.params.id }, 'Failed to save click coordinates');
+    res.status(500).json({ error: 'Failed to save click coordinates' });
+  }
+});
+
+/**
+ * GET /sessions/:id/learned-click/:buttonType
+ * Get learned click coordinates for a button type
+ */
+router.get('/:id/learned-click/:buttonType', authenticateJWT, async (req: Request, res: Response) => {
+  try {
+    const { getLearnedClick } = await import('../services/click-capture.service');
+    const coords = await getLearnedClick(req.params.buttonType);
+    
+    if (coords) {
+      res.json({ success: true, x: coords.x, y: coords.y });
+    } else {
+      res.json({ success: false, message: 'No learned coordinates for this button type' });
+    }
+  } catch (error: any) {
+    logger.error({ error: error.message, sessionId: req.params.id }, 'Failed to get learned click');
+    res.status(500).json({ error: 'Failed to get learned click' });
+  }
+});
+
 export default router;
+

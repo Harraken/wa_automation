@@ -12,7 +12,8 @@ class WebSocketService {
       return;
     }
 
-    const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:3000';
+    // Use window.location.origin to connect to the same server (nginx proxies to API)
+const API_URL = (import.meta as any).env?.VITE_SOCKET_URL || window.location.origin;
     console.log('🔌 [WEBSOCKET] Connecting to:', API_URL);
     
     this.socket = io(API_URL, {

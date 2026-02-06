@@ -64,7 +64,7 @@ services:
       STORAGE_PATH: /data/snapshots
       DOCKER_NETWORK: wa-provisioner-network
     ports:
-      - "3002:3000"
+      - "3000:3000"
     volumes:
       - ./data/snapshots:/data/snapshots
       - ./data/screenshots:/data/screenshots

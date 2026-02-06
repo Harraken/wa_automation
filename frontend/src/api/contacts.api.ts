@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:3002';
+const API_URL = (import.meta as any).env?.VITE_API_URL || '/api';
 
 export interface CreateContactRequest {
   sessionId: string;

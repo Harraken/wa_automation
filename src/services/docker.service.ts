@@ -266,6 +266,10 @@ export class DockerService {
         streamUrl 
       }, 'Emulator container started');
 
+      // Start noVNC manually (the vnc_web service in budtmo/docker-android image often crashes)
+      logger.info({ containerId: container.id }, 'Starting noVNC manually...');
+      await this.ensureNoVncRunning(container.id);
+      
       // Wait for VNC to be ready (check if port is accessible)
       logger.info({ vncPort }, 'Waiting for noVNC web interface to be ready...');
       await this.waitForVnc(vncPort, 60000);
@@ -352,6 +356,24 @@ export class DockerService {
   }
 
   /**
+   * Get the host port for a container's VNC (6080) binding.
+   * Returns null if container not found or not running.
+   */
+  async getContainerVncPort(containerId: string): Promise<number | null> {
+    try {
+      const container = docker.getContainer(containerId);
+      const inspect = await container.inspect();
+      if (!inspect.State.Running) return null;
+      const port = inspect.NetworkSettings?.Ports?.['6080/tcp']?.[0]?.HostPort;
+      return port ? parseInt(port, 10) : null;
+    } catch (error: any) {
+      if (error.statusCode === 404) return null;
+      logger.warn({ containerId, error: error.message }, 'Failed to get container VNC port');
+      return null;
+    }
+  }
+
+  /**
    * Snapshot a container
    */
   async snapshotContainer(containerId: string, snapshotPath: string): Promise<void> {
@@ -408,6 +430,51 @@ export class DockerService {
     
     // Don't throw error - VNC might still work later
     logger.warn({ port, timeout }, 'VNC did not become ready within timeout, but continuing anyway');
+  }
+
+  /**
+   * Start noVNC so the browser gets the real Android stream (not the static DOCKERANDROID logo).
+   * The image's default vnc_web often serves a static splash on 6080; we stop it and run
+   * novnc_proxy connected to x11vnc:5900 so the Stream View shows the live display.
+   */
+  private async ensureNoVncRunning(containerId: string): Promise<void> {
+    try {
+      const container = docker.getContainer(containerId);
+
+      // Wait for container and x11vnc to be up (x11vnc serves the real display on 5900)
+      await new Promise((r) => setTimeout(r, 15000));
+
+      // Stop the image's default noVNC so it doesn't keep serving the static logo on 6080
+      const stopDefaultVnc =
+        'supervisorctl stop novnc 2>/dev/null; supervisorctl stop vnc_web 2>/dev/null; pkill -f websockify 2>/dev/null; pkill -f novnc_proxy 2>/dev/null; sleep 2';
+      try {
+        const execStop = await container.exec({
+          Cmd: ['sh', '-c', stopDefaultVnc],
+          AttachStdout: true,
+          AttachStderr: true,
+        });
+        const stream = await execStop.start({ hijack: true, stdin: false });
+        stream.on('end', () => {});
+        await new Promise((r) => setTimeout(r, 3000));
+      } catch (e: any) {
+        logger.debug({ containerId, error: e.message }, 'Stop default VNC (non-fatal)');
+      }
+
+      // Start our noVNC proxy: connects to x11vnc:5900, serves WebSocket on 6080 (real stream)
+      const startNoVncCmd =
+        'nohup /opt/noVNC/utils/novnc_proxy --vnc localhost:5900 --listen 6080 > /tmp/novnc.log 2>&1 & sleep 2';
+      const exec = await container.exec({
+        Cmd: ['sh', '-c', startNoVncCmd],
+        AttachStdout: true,
+        AttachStderr: true,
+      });
+      await exec.start({ hijack: true, stdin: false });
+
+      logger.info({ containerId }, 'noVNC proxy started (stream from x11vnc:5900)');
+      await new Promise((r) => setTimeout(r, 2000));
+    } catch (error: any) {
+      logger.warn({ error: error.message, containerId }, 'Failed to start noVNC manually, will try to continue anyway');
+    }
   }
 
   /**

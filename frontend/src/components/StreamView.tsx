@@ -1,197 +1,263 @@
-import { useEffect, useRef, useState } from 'react';
+import { useRef, useState, useEffect } from 'react';
 import { Session } from '../store/session.store';
+import { startClickCapture, stopClickCapture, getLearnedClick, getStreamData } from '../api/sessions.api';
 
 interface StreamViewProps {
   session: Session;
 }
 
+// Build VNC URL using the same host as the app (works with localhost or remote/Docker host)
+function buildVncUrl(host: string, port: number): string {
+  const protocol = typeof window !== 'undefined' && window.location?.protocol === 'https:' ? 'https:' : 'http:';
+  return `${protocol}//${host}:${port}/vnc.html?autoconnect=true&resize=scale`;
+}
+
+// Extract port from streamUrl like http://localhost:6081/vnc.html?...
+function portFromStreamUrl(streamUrl: string | null): number | null {
+  if (!streamUrl) return null;
+  try {
+    const u = new URL(streamUrl);
+    return u.port ? parseInt(u.port, 10) : (u.protocol === 'https:' ? 443 : 80);
+  } catch {
+    return null;
+  }
+}
+
 export default function StreamView({ session }: StreamViewProps) {
-  const [error, setError] = useState<string | null>(null);
-  const [containerNotRunning, setContainerNotRunning] = useState(false);
-  const [isLoading, setIsLoading] = useState(true);
-  const [isFullscreen, setIsFullscreen] = useState(false);
   const iframeRef = useRef<HTMLIFrameElement>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
+  const [isCapturing, setIsCapturing] = useState(false);
+  const [learnedCoords, setLearnedCoords] = useState<{ x: number; y: number } | null>(null);
+  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
+  const [reconnectKey, setReconnectKey] = useState(0);
+  const [fetchedPort, setFetchedPort] = useState<number | null>(null);
+  const [streamLoadError, setStreamLoadError] = useState<string | null>(null);
 
+  // Resolve VNC port: from session, or from streamUrl, or fetch from API
+  const resolvedPort = session.vncPort ?? fetchedPort ?? portFromStreamUrl(session.streamUrl);
+  const host = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
+
+  // Build URL so the browser connects to the same host as the app (not hardcoded localhost)
+  const vncUrl: string | null = resolvedPort
+    ? buildVncUrl(host, resolvedPort)
+    : null;
+
+  // Always fetch stream from API when session is selected (API resolves live VNC port from Docker for persistent sessions)
   useEffect(() => {
-    if (!session.vncPort) {
-      setError('VNC port not available. The emulator may still be starting up.');
-      setIsLoading(false);
-      return;
-    }
+    let cancelled = false;
+    setStreamLoadError(null);
+    getStreamData(session.id)
+      .then((data) => {
+        if (cancelled) return;
+        const port = data.vncPort ?? (data.streamUrl ? portFromStreamUrl(data.streamUrl) : null);
+        if (port != null) setFetchedPort(port);
+      })
+      .catch(() => {
+        if (!cancelled) setStreamLoadError('Stream not available');
+      });
+    return () => { cancelled = true; };
+  }, [session.id]);
 
-    setError(null);
-    setIsLoading(true);
-  }, [session.vncPort, session.id]);
-
-  const handleFullscreen = () => {
-    if (!containerRef.current) return;
-    
-    if (!isFullscreen) {
-      if (containerRef.current.requestFullscreen) {
-        containerRef.current.requestFullscreen();
-      }
-    } else {
-      if (document.exitFullscreen) {
-        document.exitFullscreen();
-      }
-    }
-  };
-
-  useEffect(() => {
-    const handleFullscreenChange = () => {
-      setIsFullscreen(!!document.fullscreenElement);
-    };
-
-    document.addEventListener('fullscreenchange', handleFullscreenChange);
-    return () => document.removeEventListener('fullscreenchange', handleFullscreenChange);
-  }, []);
-
-  const handleReconnect = () => {
-    setError(null);
-    setContainerNotRunning(false);
-    setIsLoading(true);
-    if (iframeRef.current) {
-      iframeRef.current.src = iframeRef.current.src; // Force reload
-    }
-  };
-
-  if (!session.vncPort) {
+  if (!vncUrl) {
     return (
       <div className="flex items-center justify-center h-full bg-gray-50">
         <div className="text-center text-gray-500">
           <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-whatsapp-green mx-auto mb-4"></div>
-          <p className="font-medium">Port VNC non disponible</p>
-          <p className="text-sm mt-2">L'émulateur démarre...</p>
-        </div>
-      </div>
-    );
-  }
-
-  if (error || containerNotRunning) {
-    return (
-      <div className="flex items-center justify-center h-full bg-gray-50">
-        <div className="text-center max-w-md">
-          <div className="mb-4">
-            <svg className="w-16 h-16 mx-auto text-yellow-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-            </svg>
-          </div>
-          <h3 className="text-lg font-semibold text-gray-900 mb-2">
-            {containerNotRunning ? 'Conteneur VNC inactif' : 'Stream VNC non disponible'}
-          </h3>
-          <p className="text-sm text-gray-600 mb-4">
-            {containerNotRunning 
-              ? 'Le conteneur VNC pour cette session n\'est pas actif. La session a peut-être été arrêtée ou a échoué lors du provisioning.'
-              : error}
-          </p>
-          {!containerNotRunning && (
-          <button
-            onClick={handleReconnect}
-            className="px-4 py-2 bg-whatsapp-green text-white rounded hover:bg-whatsapp-light transition-colors"
-          >
-            🔄 Réessayer
-          </button>
-          )}
-          <p className="text-xs text-gray-400 mt-4">
-            {containerNotRunning 
-              ? 'Sélectionnez une session active dans la sidebar ou lancez un nouveau provisioning.'
-              : 'Le provisioning WhatsApp fonctionne en arrière-plan. Consultez l\'onglet "Logs" pour suivre la progression.'}
+          <p>VNC stream not available</p>
+          <p className="text-sm mt-2">
+            {streamLoadError || 'The emulator may still be starting up. Ensure the session has a VNC port.'}
           </p>
         </div>
       </div>
     );
   }
 
-  // Access VNC through nginx proxy: /vnc/{provisionId}/ routes to websockify-{provisionId}:8080/
-  // easy-novnc serves the client at root and handles websocket on the same path
-  const vncUrl = `/vnc/${session.provisionId}/`;
+  // Monitor iframe load to detect connection status and auto-reconnect
+  useEffect(() => {
+    const iframe = iframeRef.current;
+    if (!iframe) return;
+
+    const handleLoad = () => {
+      setConnectionStatus('connected');
+    };
+
+    const handleError = () => {
+      setConnectionStatus('disconnected');
+    };
+
+    iframe.addEventListener('load', handleLoad);
+    iframe.addEventListener('error', handleError);
+
+    // Check connection status periodically and auto-reconnect if needed
+    const checkInterval = setInterval(() => {
+      try {
+        // Try to access iframe content to check if it's loaded
+        if (iframe.contentWindow) {
+          setConnectionStatus('connected');
+        }
+      } catch (e) {
+        // Cross-origin error is normal, but means iframe is loaded
+        setConnectionStatus('connected');
+      }
+      
+      // Auto-reconnect if disconnected for more than 10 seconds
+      if (connectionStatus === 'disconnected') {
+        const timeout = setTimeout(() => {
+          console.log('🔄 Auto-reconnecting VNC...');
+          handleReconnect();
+        }, 10000);
+        return () => clearTimeout(timeout);
+      }
+    }, 5000);
+
+    return () => {
+      iframe.removeEventListener('load', handleLoad);
+      iframe.removeEventListener('error', handleError);
+      clearInterval(checkInterval);
+    };
+  }, [reconnectKey, connectionStatus]);
+
+  const handleReconnect = () => {
+    setConnectionStatus('connecting');
+    setReconnectKey(prev => prev + 1);
+  };
+
+  const handleStartCapture = async () => {
+    try {
+      const result = await startClickCapture(session.id, 'NEXT');
+      if (result.success) {
+        setIsCapturing(true);
+        // Check for existing learned coordinates
+        const learned = await getLearnedClick(session.id, 'NEXT');
+        if (learned.success && learned.x && learned.y) {
+          setLearnedCoords({ x: learned.x, y: learned.y });
+        }
+      } else {
+        throw new Error(result.message || 'Failed to start capture');
+      }
+    } catch (error: any) {
+      console.error('Failed to start click capture:', error);
+      let errorMessage = 'Unknown error';
+      if (error.response?.data?.error) {
+        errorMessage = typeof error.response.data.error === 'string' 
+          ? error.response.data.error 
+          : JSON.stringify(error.response.data.error);
+      } else if (error.message) {
+        errorMessage = error.message;
+      }
+      alert('Failed to start click capture: ' + errorMessage);
+    }
+  };
+
+  const handleStopCapture = async () => {
+    try {
+      await stopClickCapture(session.id);
+      setIsCapturing(false);
+    } catch (error: any) {
+      console.error('Failed to stop click capture:', error);
+      alert('Failed to stop click capture: ' + (error.response?.data?.error || error.message));
+    }
+  };
 
   return (
-    <div ref={containerRef} className="h-full flex flex-col bg-gray-900">
-      {/* Control bar */}
+    <div className="h-full flex flex-col bg-gray-900">
+      {/* Status bar */}
       <div className="bg-gray-800 px-4 py-2 flex items-center justify-between border-b border-gray-700">
         <div className="flex items-center gap-3">
-          <div className={`w-3 h-3 rounded-full ${isLoading ? 'bg-yellow-500 animate-pulse' : 'bg-green-500'}`}></div>
-          <span className="text-sm font-medium text-gray-300">Stream VNC</span>
-          <span className="text-xs text-gray-500">Port {session.vncPort}</span>
+          <div className={`w-3 h-3 rounded-full ${
+            connectionStatus === 'connected' ? 'bg-green-500' :
+            connectionStatus === 'connecting' ? 'bg-yellow-500 animate-pulse' :
+            'bg-red-500'
+          }`}></div>
+          <span className="text-sm text-gray-300">VNC Stream</span>
+          {connectionStatus === 'disconnected' && (
+            <button
+              onClick={handleReconnect}
+              className="px-2 py-1 bg-blue-600 hover:bg-blue-700 text-white text-xs rounded transition-colors"
+            >
+              🔄 Reconnect
+            </button>
+          )}
         </div>
-        
-        <div className="flex items-center gap-2">
-          {/* Reconnect button */}
-          <button
-            onClick={handleReconnect}
-            className="px-3 py-1 text-xs bg-gray-700 text-gray-300 rounded hover:bg-gray-600 transition-colors flex items-center gap-1"
-            title="Reconnecter"
-          >
-            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-            </svg>
-            Reconnecter
-          </button>
-
-          {/* Fullscreen button */}
-          <button
-            onClick={handleFullscreen}
-            className="px-3 py-1 text-xs bg-gray-700 text-gray-300 rounded hover:bg-gray-600 transition-colors flex items-center gap-1"
-            title={isFullscreen ? "Quitter le plein écran" : "Plein écran"}
-          >
-            {isFullscreen ? (
-              <>
-                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                </svg>
-                Quitter
-              </>
-            ) : (
-              <>
-                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
-                </svg>
-                Plein écran
-              </>
-            )}
-          </button>
+        <div className="flex items-center gap-3">
+          {learnedCoords && (
+            <div className="text-xs text-green-400">
+              📍 Learned: ({learnedCoords.x}, {learnedCoords.y})
+            </div>
+          )}
+          {isCapturing ? (
+            <button
+              onClick={handleStopCapture}
+              className="px-3 py-1 bg-red-600 hover:bg-red-700 text-white text-xs rounded transition-colors flex items-center gap-2"
+            >
+              <div className="w-2 h-2 rounded-full bg-white animate-pulse"></div>
+              Stop Capture
+            </button>
+          ) : (
+            <button
+              onClick={handleStartCapture}
+              className="px-3 py-1 bg-whatsapp-green hover:bg-green-600 text-white text-xs rounded transition-colors"
+            >
+              🎯 Capture Click
+            </button>
+          )}
+          <div className="text-xs text-gray-400">
+            Port: {resolvedPort ?? '—'}
+          </div>
+          {vncUrl && (
+            <a
+              href={vncUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-xs text-blue-400 hover:text-blue-300"
+            >
+              Open in new tab
+            </a>
+          )}
         </div>
       </div>
 
       {/* VNC iframe */}
       <div className="flex-1 overflow-hidden relative">
-        {isLoading && (
-          <div className="absolute inset-0 flex items-center justify-center bg-gray-900 z-10">
-            <div className="text-center text-gray-400">
-              <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-whatsapp-green mx-auto mb-4"></div>
-              <p>Connexion au stream VNC...</p>
-            </div>
-          </div>
-        )}
-        
         <iframe
+          key={reconnectKey}
           ref={iframeRef}
           src={vncUrl}
           className="w-full h-full border-0"
           title="VNC Stream"
           allow="clipboard-read; clipboard-write"
-          onLoad={() => {
-            // Mark as loaded after a short delay
-            setTimeout(() => setIsLoading(false), 1000);
-          }}
-          onError={async () => {
-            // Check if it's a 502 error (container not running)
-            try {
-              const response = await fetch(vncUrl, { method: 'HEAD' });
-              if (response.status === 502 || response.status === 503) {
-                setContainerNotRunning(true);
-              } else {
-                setError('Impossible de charger le stream VNC. Vérifiez que l\'émulateur est en cours d\'exécution.');
-              }
-            } catch {
-            setError('Impossible de charger le stream VNC. Vérifiez que l\'émulateur est en cours d\'exécution.');
-            }
-            setIsLoading(false);
-          }}
+          onLoad={() => setConnectionStatus('connected')}
+          onError={() => setConnectionStatus('disconnected')}
         />
+        {connectionStatus === 'disconnected' && (
+          <div className="absolute inset-0 bg-black bg-opacity-75 flex items-center justify-center">
+            <div className="bg-white rounded-lg p-6 text-center">
+              <div className="text-red-500 text-4xl mb-4">⚠️</div>
+              <h3 className="text-lg font-semibold mb-2">VNC Connection Lost</h3>
+              <p className="text-sm text-gray-600 mb-4">The emulator connection was lost. Click reconnect to restore.</p>
+              <button
+                onClick={handleReconnect}
+                className="px-4 py-2 bg-whatsapp-green text-white rounded-lg hover:bg-green-600 transition-colors"
+              >
+                🔄 Reconnect
+              </button>
+            </div>
+          </div>
+        )}
+        {connectionStatus === 'connecting' && (
+          <div className="absolute inset-0 bg-black bg-opacity-50 flex items-center justify-center">
+            <div className="text-white text-center">
+              <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-white mx-auto mb-4"></div>
+              <p>Connecting to emulator...</p>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
 }
+
+
+
+
+
+

@@ -3,28 +3,17 @@ import { remote, RemoteOptions } from 'webdriverio';
 import axios from 'axios';
 import * as fs from 'fs';
 import * as path from 'path';
+import { clickViaVnc, clickViaAdb, clickNextButtonViaVnc, clickAgreeButtonViaVnc, clickNextButtonViaAdb, clickOkButtonViaAdb, smartClickNextViaVnc, smartClickOkViaVnc, smartClickAgreeViaVnc, clickViaNativeVnc, debugX11WindowPosition, clickViaXdotoolWithWindowDetection } from '../utils/vncClick';
+import { getLearnedClick } from '../services/click-capture.service';
 
 const logger = createChildLogger('whatsapp-automation');
-
-// WhatsApp Registration Steps - Clear methodology
-export enum WhatsAppStep {
-  LAUNCHING_APP = 'LAUNCHING_APP',
-  ACCEPTING_TERMS = 'ACCEPTING_TERMS',
-  COUNTRY_SELECTION = 'COUNTRY_SELECTION',
-  PHONE_NUMBER_ENTRY = 'PHONE_NUMBER_ENTRY',
-  CLICKING_NEXT = 'CLICKING_NEXT',
-  WAITING_FOR_SMS_SCREEN = 'WAITING_FOR_SMS_SCREEN',
-  RECEIVING_SMS = 'RECEIVING_SMS',
-  ENTERING_CODE = 'ENTERING_CODE',
-  PROFILE_SETUP = 'PROFILE_SETUP',
-  COMPLETED = 'COMPLETED'
-}
 
 export interface AutomationOptions {
   appiumPort: number;
   phoneNumber?: string; // Now optional! Will be provided by buyNumberCallback
   sessionId: string;
   containerId?: string; // Container ID for ADB installation
+  vncPort?: number; // VNC port for clicking via VNC (bypasses anti-bot detection)
   countryName?: string; // Country name (e.g., "Canada", "United States") to help WhatsApp select correct country
   buyNumberCallback?: () => Promise<{ number: string; request_id: string }>; // Callback to buy number when ready
   onLog?: (message: string) => void; // Callback for detailed logs
@@ -33,67 +22,10 @@ export interface AutomationOptions {
 
 export class WhatsAppAutomationService {
   /**
-   * Log a step with clear formatting
+   * Save screenshot for debugging
    */
-  private logStep(step: WhatsAppStep, message: string, log?: (msg: string) => void): void {
-    const formattedMessage = `
-
-═══════════════════════════════════════════════════════════════
-🎯 ÉTAPE: ${step}
-${message}
-═══════════════════════════════════════════════════════════════
-`;
-    logger.info({ step, message }, 'WhatsApp step');
-    console.log(formattedMessage);
-    if (log) log(formattedMessage);
-  }
-
-  /**
-   * Log current page/screen with detailed info
-   */
-  private async logCurrentScreen(driver: any, _sessionId: string, log: (msg: string) => void): Promise<void> {
+  private async saveScreenshot(driver: any, step: string, sessionId: string): Promise<void> {
     try {
-      const activity = await driver.getCurrentActivity();
-      const packageName = await driver.getCurrentPackage();
-      log(`📱 PAGE ACTUELLE: ${packageName} / ${activity}`);
-      
-      // Try to get visible text on screen
-      try {
-        const visibleTexts = await driver.$$('//android.widget.TextView');
-        const texts: string[] = [];
-        for (const element of visibleTexts.slice(0, 5)) { // Only first 5 to avoid spam
-          try {
-            const text = await element.getText();
-            if (text && text.trim().length > 0 && text.trim().length < 50) {
-              texts.push(text.trim());
-            }
-          } catch (e) {
-            // Ignore
-          }
-        }
-        if (texts.length > 0) {
-          log(`📝 TEXTES VISIBLES: ${texts.join(', ')}`);
-        }
-      } catch (e) {
-        // Ignore
-      }
-    } catch (error: any) {
-      log(`⚠️ Impossible de récupérer l'écran actuel: ${error.message}`);
-    }
-  }
-
-  /**
-   * Save screenshot for debugging with detailed logging
-   * Automatically logs current screen before taking screenshot
-   */
-  private async saveScreenshot(driver: any, step: string, sessionId: string, log?: (msg: string) => void): Promise<void> {
-    try {
-      if (log) {
-        log(`📸 === CAPTURE D'ÉCRAN: "${step}" ===`);
-        // Log current screen info before screenshot
-        await this.logCurrentScreen(driver, sessionId, log);
-      }
-      
       const screenshot = await driver.takeScreenshot();
       
       // Use /data/screenshots if it exists (Docker volume), otherwise use ./data/screenshots
@@ -112,10 +44,72 @@ ${message}
       fs.writeFileSync(filepath, Buffer.from(screenshot, 'base64'));
       
       logger.info({ filepath, step }, 'Screenshot saved');
-      if (log) log(`✅ Screenshot sauvegardé: ${filename}`);
+      console.log(`📸 [SCREENSHOT] Saved: ${filepath}`);
     } catch (error: any) {
       logger.warn({ error: error.message, step }, 'Failed to save screenshot');
-      if (log) log(`⚠️ Échec screenshot: ${error.message}`);
+      console.log(`⚠️ [SCREENSHOT] Failed to save screenshot for step "${step}": ${error.message}`);
+      console.log(`⚠️ [SCREENSHOT] Error stack: ${error.stack}`);
+    }
+  }
+
+  /**
+   * Get current activity via ADB (fallback when Appium session is terminated)
+   */
+  private async getCurrentActivityViaAdb(containerId: string, log: (msg: string) => void): Promise<string> {
+    try {
+      const Docker = (await import('dockerode')).default;
+      const docker = new Docker();
+      const container = docker.getContainer(containerId);
+      
+      const exec = await container.exec({
+        Cmd: ['sh', '-c', 'adb -e shell dumpsys window windows | grep -E "mCurrentFocus|mFocusedApp" | head -1'],
+        AttachStdout: true,
+        AttachStderr: true,
+      });
+      
+      const stream = await exec.start({ Detach: false, Tty: false });
+      let output = '';
+      await new Promise<void>((resolve) => {
+        stream.on('data', (chunk: Buffer) => { output += chunk.toString(); });
+        stream.on('end', () => resolve());
+        setTimeout(() => resolve(), 3000);
+      });
+      
+      // Extract activity from output (format: "mCurrentFocus=Window{... com.whatsapp/.registration.app.VerifyPhone}")
+      const activityMatch = output.match(/com\.whatsapp[^\s}]+/);
+      if (activityMatch) {
+        const activity = activityMatch[0];
+        log(`📱 ADB activity check: ${activity}`);
+        return activity;
+      }
+      
+      // Fallback: try simpler command
+      const exec2 = await container.exec({
+        Cmd: ['sh', '-c', 'adb -e shell dumpsys activity activities | grep "mResumedActivity" | head -1'],
+        AttachStdout: true,
+        AttachStderr: true,
+      });
+      
+      const stream2 = await exec2.start({ Detach: false, Tty: false });
+      let output2 = '';
+      await new Promise<void>((resolve) => {
+        stream2.on('data', (chunk: Buffer) => { output2 += chunk.toString(); });
+        stream2.on('end', () => resolve());
+        setTimeout(() => resolve(), 3000);
+      });
+      
+      const activityMatch2 = output2.match(/com\.whatsapp[^\s}]+/);
+      if (activityMatch2) {
+        const activity = activityMatch2[0];
+        log(`📱 ADB activity check (fallback): ${activity}`);
+        return activity;
+      }
+      
+      log(`⚠️ Could not determine activity via ADB`);
+      return 'unknown';
+    } catch (e: any) {
+      log(`⚠️ ADB activity check failed: ${e.message}`);
+      return 'unknown';
     }
   }
 
@@ -151,7 +145,7 @@ ${message}
    * Automate WhatsApp registration in emulator
    */
   async automateRegistration(options: AutomationOptions): Promise<void> {
-    const { appiumPort, phoneNumber: initialPhoneNumber, sessionId, countryName, buyNumberCallback, onLog, onStateChange } = options;
+    const { appiumPort, phoneNumber: initialPhoneNumber, sessionId, containerId, vncPort, countryName, buyNumberCallback, onLog, onStateChange } = options;
     
     const log = (message: string) => {
       logger.info(message);
@@ -189,7 +183,6 @@ ${message}
           'appium:skipUnlock': true,
           'appium:waitForIdleTimeout': 3000,
           'appium:androidInstallTimeout': 90000,
-          'appium:newCommandTimeout': 600, // 10 minutes - critical for number purchase callback
         },
       };
 
@@ -198,12 +191,12 @@ ${message}
       log(`✅ Connected to Appium server successfully`);
       
       // Capture initial state
-      await this.saveScreenshot(driver, '01-connected', sessionId, log);
+      await this.saveScreenshot(driver, '01-connected', sessionId);
       await this.logPageSource(driver, '01-connected', sessionId);
 
       // Wait for system to stabilize
-      log(`⏳ Waiting for system to stabilize...`);
-      await this.sleep(2000);
+      log(`⏳ Waiting 5 seconds for system to stabilize...`);
+      await this.sleep(5000);
 
       // Check if WhatsApp needs to be installed
       log(`🔍 Checking if WhatsApp is installed...`);
@@ -211,7 +204,7 @@ ${message}
       
       if (!isInstalled) {
         log(`⚠️ WhatsApp is not installed, attempting automatic installation...`);
-        await this.saveScreenshot(driver, 'before-whatsapp-install', sessionId, log);
+        await this.saveScreenshot(driver, 'before-whatsapp-install', sessionId);
         
         // Try to install WhatsApp automatically
         try {
@@ -228,7 +221,7 @@ ${message}
           log(`✅ WhatsApp installed successfully, proceeding with automation`);
         } catch (installError: any) {
           log(`❌ Failed to install WhatsApp automatically: ${installError.message}`);
-          await this.saveScreenshot(driver, 'error-whatsapp-install-failed', sessionId, log);
+          await this.saveScreenshot(driver, 'error-whatsapp-install-failed', sessionId);
           throw new Error(`WhatsApp installation failed: ${installError.message}. Please install WhatsApp manually in the emulator.`);
         }
       } else {
@@ -236,55 +229,46 @@ ${message}
       }
 
       // Launch WhatsApp using monkey command directly (most reliable)
-      log(`📱 ========================================`);
-      log(`📱 LANCEMENT DE L'APPLICATION WHATSAPP`);
-      log(`📱 ========================================`);
+      log(`🚀 Launching WhatsApp application...`);
       log(`📦 Package: com.whatsapp`);
       
-      log(`🚀 Exécution de la commande pour lancer WhatsApp...`);
+      log(`🔍 Using monkey command to launch WhatsApp...`);
       try {
         await driver.execute('mobile: shell', {
           command: 'monkey',
           args: ['-p', 'com.whatsapp', '-c', 'android.intent.category.LAUNCHER', '1'],
         });
-        log(`✅ Commande de lancement exécutée`);
-        log(`⏳ WhatsApp est en train de démarrer...`);
-        await this.sleep(2000);
+        log(`✅ Monkey command executed`);
+        await this.sleep(3000);
       } catch (error: any) {
-        log(`⚠️ Première méthode échouée: ${error.message}`);
+        log(`⚠️ Monkey command failed: ${error.message}`);
         // Fallback: try activateApp
         try {
-          log(`🔄 Tentative alternative pour lancer WhatsApp...`);
+          log(`🔄 Fallback: Trying activateApp...`);
           await driver.activateApp('com.whatsapp');
-          log(`✅ Méthode alternative réussie`);
+          log(`✅ activateApp succeeded`);
           await this.sleep(3000);
         } catch (e: any) {
-          log(`❌ Impossible de lancer WhatsApp: ${e.message}`);
-          throw new Error(`Failed to launch WhatsApp: ${error.message}`);
+          log(`⚠️ activateApp also failed: ${e.message}`);
         }
       }
       
-      log(`🔍 Vérification que WhatsApp s'est bien lancé...`);
-      await this.sleep(2000);
+      // Skip waiting loop - just wait a bit for WhatsApp to launch and get activity
+      log(`⏳ Waiting 3 seconds for WhatsApp to launch...`);
+      await this.sleep(3000);
       
       let currentActivity = '';
       try {
         currentActivity = await driver.getCurrentActivity();
-        log(`📱 Activité détectée: ${currentActivity}`);
-        
-        if (currentActivity.includes('whatsapp')) {
-          log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-          log(`✅ WHATSAPP S'EST LANCÉ AVEC SUCCÈS !`);
-          log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-        }
+        log(`📱 Current activity: ${currentActivity}`);
       } catch (e: any) {
-        log(`⚠️ Impossible de détecter l'activité: ${e.message}`);
+        log(`⚠️ Could not get current activity: ${e.message}`);
       }
       
       // Continue with flow regardless of activity (skip waiting loop)
       
-      log(`📸 Capture d'écran de WhatsApp...`);
-      await this.saveScreenshot(driver, '02-whatsapp-launched', sessionId, log);
+      log(`📸 Taking screenshot after WhatsApp launch...`);
+      await this.saveScreenshot(driver, '02-whatsapp-launched', sessionId);
       await this.logPageSource(driver, '02-whatsapp-launched', sessionId);
       
       log(`📱 Final activity: ${currentActivity}`);
@@ -296,8 +280,8 @@ ${message}
       // Check if we're on EULA screen and handle it
       if (currentActivity.includes('EULA') || currentActivity.includes('eula')) {
         log(`📜 Detected EULA screen, attempting to accept terms...`);
-        await this.saveScreenshot(driver, '02-eula-detected', sessionId, log);
-        await this.handleEULAScreen(driver, log, sessionId);
+        await this.saveScreenshot(driver, '02-eula-detected', sessionId);
+        await this.handleEULAScreen(driver, log, sessionId, vncPort);
         await this.sleep(3000);
         
         // Re-check activity after accepting EULA
@@ -309,7 +293,7 @@ ${message}
           if (currentActivity.includes('EULA') || currentActivity.includes('eula')) {
             log(`⚠️ Still on EULA, waiting longer and trying one more time...`);
             await this.sleep(5000);
-            await this.handleEULAScreen(driver, log, sessionId);
+            await this.handleEULAScreen(driver, log, sessionId, vncPort);
             await this.sleep(3000);
             currentActivity = await driver.getCurrentActivity();
             log(`📱 Activity after second EULA attempt: ${currentActivity}`);
@@ -339,7 +323,7 @@ ${message}
       
       // Enter phone number
       log(`📝 Starting phone number entry process...`);
-      await this.enterPhoneNumber(driver, phoneNumber, countryName, log, sessionId);
+      await this.enterPhoneNumber(driver, phoneNumber, countryName, log, sessionId, vncPort, containerId);
       
       log(`✅ Phone number ${phoneNumber} entered and submitted successfully`);
       log(`📱 SMS code request should have been sent to WhatsApp`);
@@ -347,57 +331,8 @@ ${message}
       
       // Take final screenshot
       await this.sleep(2000);
-      await this.saveScreenshot(driver, '08-after-phone-entry', sessionId, log);
+      await this.saveScreenshot(driver, '08-after-phone-entry', sessionId);
       await this.logPageSource(driver, '08-after-phone-entry', sessionId);
-      
-      // CRITICAL: Check if phone number is already registered on another device
-      log(`🔍 Vérification si le numéro est déjà enregistré sur un autre appareil...`);
-      try {
-        const currentActivity = await driver.getCurrentActivity();
-        log(`📱 Activité actuelle: ${currentActivity}`);
-        
-        // Check for "Use your other phone" message indicating phone is already registered
-        const alreadyRegisteredIndicators = [
-          '//android.widget.TextView[contains(@text, "Use your other phone")]',
-          '//android.widget.TextView[contains(@text, "confirm moving")]',
-          '//android.widget.TextView[contains(@text, "Verify +")]',
-          '//android.widget.TextView[contains(@text, "get the 6-digit code")]',
-        ];
-        
-        let phoneAlreadyRegistered = false;
-        for (const indicator of alreadyRegisteredIndicators) {
-          try {
-            const elem = await driver.$(indicator);
-            if (await elem.isExisting()) {
-              const text = await elem.getText().catch(() => '');
-              log(`⚠️ INDICATEUR DÉTECTÉ: "${text}"`);
-              if (text.toLowerCase().includes('use your other phone') || 
-                  text.toLowerCase().includes('confirm moving') ||
-                  text.toLowerCase().includes('get the 6-digit code')) {
-                phoneAlreadyRegistered = true;
-                log(`❌ Le numéro ${phoneNumber} est déjà enregistré sur un autre appareil !`);
-                break;
-              }
-            }
-          } catch (e) {
-            continue;
-          }
-        }
-        
-        if (phoneAlreadyRegistered) {
-          await this.saveScreenshot(driver, '09-phone-already-registered', sessionId, log);
-          log(`📸 Screenshot de l'écran "phone already registered" sauvegardé`);
-          throw new Error(`PHONE_ALREADY_REGISTERED:${phoneNumber}`);
-        }
-        
-        log(`✅ Le numéro n'est pas enregistré ailleurs, on peut continuer`);
-      } catch (error: any) {
-        if (error.message && error.message.startsWith('PHONE_ALREADY_REGISTERED:')) {
-          throw error; // Re-throw this specific error
-        }
-        log(`⚠️ Impossible de vérifier si le numéro est enregistré: ${error.message}`);
-        // Continue anyway - we'll let the OTP polling handle it
-      }
       
       log(`📸 All screenshots and page sources saved in: data/screenshots/${sessionId}/`);
       
@@ -448,7 +383,7 @@ ${message}
               log(`✅ Alert dialog dismissed`);
               
               // Take screenshot after dismissing alert
-              await this.saveScreenshot(driver, '02-alert-dismissed', sessionId, log);
+              await this.saveScreenshot(driver, '02-alert-dismissed', sessionId);
               
               // Check if there are more alerts
               await this.sleep(1000);
@@ -478,7 +413,7 @@ ${message}
                 await btn.click();
                 await this.sleep(2000);
                 log(`✅ Alert dismissed`);
-                await this.saveScreenshot(driver, '02-alert-dismissed', sessionId, log);
+                await this.saveScreenshot(driver, '02-alert-dismissed', sessionId);
                 await this.sleep(1000);
                 // Recursive call to check for more alerts
                 await this.dismissAlerts(driver, log, sessionId);
@@ -503,7 +438,7 @@ ${message}
   /**
    * Handle EULA (End User License Agreement) screen
    */
-  private async handleEULAScreen(driver: any, log: (msg: string) => void, sessionId: string): Promise<void> {
+  private async handleEULAScreen(driver: any, log: (msg: string) => void, sessionId: string, vncPort?: number): Promise<void> {
     log(`🔍 Analyzing EULA screen to find accept/agree button...`);
     
     try {
@@ -554,7 +489,7 @@ ${message}
                   
                   if (!newActivity.includes('EULA') && !newActivity.includes('eula')) {
                     log(`✅ Successfully passed EULA screen`);
-                    await this.saveScreenshot(driver, '04-after-eula', sessionId, log);
+                    await this.saveScreenshot(driver, '04-after-eula', sessionId);
                     return;
                   }
                 }
@@ -602,7 +537,7 @@ ${message}
                 const newActivity = await driver.getCurrentActivity();
                 if (!newActivity.includes('EULA') && !newActivity.includes('eula')) {
                   log(`✅ Successfully passed EULA screen`);
-                  await this.saveScreenshot(driver, '04-after-eula', sessionId, log);
+                  await this.saveScreenshot(driver, '04-after-eula', sessionId);
                   return;
                 }
               }
@@ -615,263 +550,127 @@ ${message}
         log(`⚠️ Could not find clickable elements: ${e.message}`);
       }
       
+      // FALLBACK: Try clicking via VNC (bypasses anti-bot detection)
+      if (vncPort) {
+        log(`🖱️ Attempting to click "Agree" button via VNC (port ${vncPort})...`);
+        
+        try {
+          const vncResult = await clickAgreeButtonViaVnc(vncPort, log);
+          
+          if (vncResult.success) {
+            log(`✅ VNC click sent for AGREE button!`);
+            await this.sleep(3000);
+            
+            // Verify page changed
+            const activityAfterVnc = await driver.getCurrentActivity().catch(() => 'unknown');
+            log(`📱 Activity after VNC AGREE click: ${activityAfterVnc}`);
+            
+            if (!activityAfterVnc.includes('EULA')) {
+              log(`✅ VNC click worked! EULA passed, now on: ${activityAfterVnc}`);
+              await this.saveScreenshot(driver, '04-after-eula-vnc', sessionId);
+              return;
+            }
+          } else {
+            log(`⚠️ VNC click failed: ${vncResult.error}`);
+          }
+        } catch (vncError: any) {
+          log(`⚠️ VNC click error: ${vncError.message}`);
+        }
+      }
+      
       log(`⚠️ Could not automatically accept EULA, proceeding anyway - may need manual intervention`);
-      await this.saveScreenshot(driver, '03-eula-unable-to-accept', sessionId, log);
+      await this.saveScreenshot(driver, '03-eula-unable-to-accept', sessionId);
     } catch (error: any) {
       log(`❌ Error handling EULA screen: ${error.message}`);
-      await this.saveScreenshot(driver, '03-eula-error', sessionId, log);
+      await this.saveScreenshot(driver, '03-eula-error', sessionId);
       // Don't throw - continue anyway
     }
   }
 
   /**
-   * Handle any unexpected popup by trying to click Skip, Continue, Not now, OK, etc.
+   * Handle phone number confirmation dialog "Is this the correct number?"
    */
-  private async handleUnexpectedPopup(driver: any, log: (msg: string) => void, sessionId: string): Promise<boolean> {
+  private async handlePhoneConfirmationDialog(driver: any, log: (msg: string) => void, sessionId: string): Promise<boolean> {
     try {
-      await this.saveScreenshot(driver, 'unexpected-popup', sessionId, log);
+      log(`🔍 Checking for phone number confirmation dialog...`);
       
-      // Try all common dismissal buttons in order of preference
-      const dismissButtons = [
-        // "Continue" buttons (to proceed with permission)
-        '//android.widget.Button[@text="Continue"]',
-        '//android.widget.Button[@text="CONTINUE"]',
-        '//*[@text="Continue"]',
-        // "Not now" buttons (to skip)
-        '//android.widget.Button[@text="Not now"]',
-        '//android.widget.Button[@text="NOT NOW"]',
-        '//*[@text="Not now"]',
-        // "Skip" buttons
-        '//android.widget.Button[@text="Skip"]',
-        '//android.widget.Button[@text="SKIP"]',
-        '//*[@text="Skip"]',
-        // "OK" buttons
-        '//android.widget.Button[@text="OK"]',
-        '//android.widget.Button[@text="Ok"]',
-        '//*[@text="OK"]',
-        // "Allow" buttons (for permissions)
-        '//android.widget.Button[@text="Allow"]',
-        '//android.widget.Button[@text="ALLOW"]',
-        '//*[@text="Allow"]',
-        '//*[@text="While using the app"]',
+      // First, take a screenshot to see current screen
+      await this.saveScreenshot(driver, 'confirmation-dialog-check', sessionId);
+      
+      // Look for "Yes" button in confirmation dialog
+      const yesSelectors = [
+        '//android.widget.Button[@text="Yes"]',
+        '//android.widget.Button[@text="YES"]',
+        '//*[@text="Yes"]',
+        '//*[@text="YES"]',
+        '//*[@content-desc="Yes"]',
+        '//*[@content-desc="YES"]',
       ];
       
-      for (const selector of dismissButtons) {
+      log(`🔍 Trying ${yesSelectors.length} specific "Yes" selectors...`);
+      for (let i = 0; i < yesSelectors.length; i++) {
+        const selector = yesSelectors[i];
         try {
-          const button = await driver.$(selector);
-          const exists = await button.isExisting().catch(() => false);
+          log(`   [${i+1}/${yesSelectors.length}] Trying: ${selector}`);
+          const yesButton = await driver.$(selector);
+          const exists = await yesButton.isExisting();
+          
           if (exists) {
-            const isDisplayed = await button.isDisplayed().catch(() => false);
+            const isDisplayed = await yesButton.isDisplayed().catch(() => false);
             if (isDisplayed) {
-              const buttonText = await button.getText().catch(() => 'unknown');
-              log(`✅ Bouton "${buttonText}" trouvé sur popup inattendu, clic...`);
-              await button.click();
-              await this.sleep(1500);
-              await this.saveScreenshot(driver, 'after-unexpected-popup-dismiss', sessionId, log);
-              log(`✅ Popup inattendu fermé avec "${buttonText}"`);
-              
-              // Check if another popup appeared (e.g., native Android permission)
-              const activity = await driver.getCurrentActivity().catch(() => '');
-              if (activity.includes('GrantPermissionsActivity') || activity.includes('permission')) {
-                log(`🔍 Permission Android détectée après popup, gestion...`);
-                // Try to click Allow on native permission dialog
-                const allowButton = await driver.$('//*[@text="Allow"]');
-                if (await allowButton.isExisting().catch(() => false)) {
-                  await allowButton.click();
-                  await this.sleep(1000);
-                  log(`✅ Permission Android accordée`);
-                }
-              }
-              
+              const buttonText = await yesButton.getText().catch(() => '');
+              log(`✅ Found confirmation dialog with "${buttonText}" button using selector: ${selector}`);
+              log(`🖱️ Clicking "Yes" button now...`);
+              await yesButton.click();
+              await this.sleep(2000);
+              log(`✅ Phone number confirmation dialog dismissed`);
+              await this.saveScreenshot(driver, '05-confirmation-yes-clicked', sessionId);
               return true;
+            } else {
+              log(`   ❌ Element exists but not displayed`);
             }
+          } else {
+            log(`   ❌ Element not found`);
           }
-        } catch (e) {
-          continue;
+        } catch (e: any) {
+          log(`   ⚠️ Error: ${e.message}`);
+          // Continue to next selector
         }
       }
       
-      log(`ℹ️ Aucun bouton de fermeture trouvé sur popup inattendu`);
-      return false;
-    } catch (error: any) {
-      log(`⚠️ Erreur lors de la gestion du popup inattendu: ${error.message}`);
-      return false;
-    }
-  }
-
-  /**
-   * Handle "Contacts" permission popup that can appear DURING phone number entry
-   * This is different from the post-OTP permission popup
-   */
-  private async handleContactsPopupDuringPhoneEntry(driver: any, log: (msg: string) => void, sessionId: string): Promise<void> {
-    try {
-      await this.sleep(1000);
-      await this.saveScreenshot(driver, 'check-contacts-popup-during-phone', sessionId, log);
-      
-      // Check for the "Contacts" permission popup
-      const contactsPopupIndicators = [
-        '//*[@text="Contacts"]',
-        '//*[contains(@text, "Contacts")]',
-        '//*[contains(@text, "verify your number and easily send messages")]',
-        '//*[contains(@text, "allow WhatsApp to access your contacts")]',
-      ];
-      
-      let isContactsPopup = false;
-      for (const indicator of contactsPopupIndicators) {
-        try {
-          const elem = await driver.$(indicator);
-          const exists = await elem.isExisting().catch(() => false);
-          if (exists) {
-            log(`✅ Popup "Contacts" détecté pendant la saisie du numéro !`);
-            isContactsPopup = true;
-            break;
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-      
-      if (isContactsPopup) {
-        log(`🖱️ Recherche du bouton "Continue" pour accepter l'accès aux contacts...`);
-        
-        const continueSelectors = [
-          '//android.widget.Button[@text="Continue"]',
-          '//android.widget.Button[@text="CONTINUE"]',
-          '//*[@text="Continue"]',
-          '//*[@text="CONTINUE"]',
-          '//android.widget.TextView[@text="Continue"]',
-          '//*[contains(@text, "Continue")]',
-        ];
-        
-        let continueClicked = false;
-        for (const selector of continueSelectors) {
+      // Also try scanning all buttons for "Yes"
+      log(`🔍 Scanning ALL buttons on screen for "Yes"...`);
+      try {
+        const allButtons = await driver.$$('android.widget.Button');
+        log(`📊 Found ${allButtons.length} buttons total`);
+        for (let i = 0; i < Math.min(allButtons.length, 10); i++) {
           try {
-            const continueButton = await driver.$(selector);
-            const exists = await continueButton.isExisting().catch(() => false);
+            const btn = allButtons[i];
+            const exists = await btn.isExisting();
             if (exists) {
-              const isDisplayed = await continueButton.isDisplayed().catch(() => false);
-              if (isDisplayed) {
-                log(`✅ Bouton "Continue" trouvé, clic...`);
-                await continueButton.click();
-                await this.sleep(1500);
-                await this.saveScreenshot(driver, 'contacts-popup-accepted-during-phone', sessionId, log);
-                log(`✅ Popup "Contacts" accepté avec succès ! Accès aux contacts accordé.`);
-                
-                // After clicking Continue, Android might show native permission dialog
-                log(`🔍 Vérification si une permission Android native apparaît...`);
-                await this.sleep(1500);
-                
-                try {
-                  const activity = await driver.execute('mobile: getCurrentActivity').catch(() => '');
-                  if (activity.includes('GrantPermissionsActivity')) {
-                    log(`✅ Permission Android native détectée, clic sur "Allow"...`);
-                    
-                    const allowSelectors = [
-                      '//*[@resource-id="com.android.permissioncontroller:id/permission_allow_button"]',
-                      '//android.widget.Button[@text="Allow"]',
-                      '//*[@text="Allow"]',
-                    ];
-                    
-                    for (const allowSelector of allowSelectors) {
-                      try {
-                        const allowButton = await driver.$(allowSelector);
-                        const allowExists = await allowButton.isExisting().catch(() => false);
-                        if (allowExists) {
-                          await allowButton.click();
-                          await this.sleep(2000);
-                          await this.saveScreenshot(driver, 'native-allow-during-phone', sessionId, log);
-                          log(`✅ Permission Android native accordée !`);
-                          break;
-                        }
-                      } catch (e) {
-                        continue;
-                      }
-                    }
-                  }
-                } catch (e: any) {
-                  log(`⚠️ Erreur vérification permission native: ${e.message}`);
-                }
-                
-                continueClicked = true;
-                break;
+              const isDisplayed = await btn.isDisplayed().catch(() => false);
+              const text = await btn.getText().catch(() => '');
+              log(`   Button #${i}: text="${text}", displayed=${isDisplayed}`);
+              
+              // Look for "Yes" button (skip "Edit")
+              if (isDisplayed && text && text.toUpperCase() === 'YES') {
+                log(`✅ Found "Yes" button (#${i}): "${text}", clicking to confirm phone number...`);
+                await btn.click();
+                await this.sleep(2000);
+                log(`✅ Phone number confirmed`);
+                await this.saveScreenshot(driver, '05-confirmation-yes-clicked', sessionId);
+                return true;
               }
             }
           } catch (e) {
-            continue;
+            // Continue
           }
         }
-        
-        if (!continueClicked) {
-          log(`⚠️ Impossible de cliquer sur "Continue", mais continuons...`);
-        }
-      } else {
-        log(`ℹ️ Pas de popup "Contacts" détecté à ce moment, continuons...`);
+      } catch (e: any) {
+        log(`⚠️ Could not scan buttons for confirmation: ${e.message}`);
       }
       
-    } catch (error: any) {
-      log(`⚠️ Erreur lors de la vérification du popup Contacts: ${error.message}`);
-      // Don't throw - this is optional
-    }
-  }
-
-  /**
-   * Try EVERYTHING to move to next page - aggressive approach
-   */
-  /**
-   * Check for and handle the phone confirmation dialog that appears after clicking Next
-   * Dialog text: "Is this OK? +X XXX-XXX-XXXX"
-   */
-  private async handleConfirmationDialog(driver: any, log: (msg: string) => void, sessionId: string): Promise<boolean> {
-    log(`🔍 Checking for phone confirmation dialog...`);
-    await this.sleep(1500); // Wait for dialog to appear
-    
-    try {
-      await this.saveScreenshot(driver, 'check-confirmation-dialog', sessionId, log);
-      
-      // Check for confirmation dialog indicators
-      const dialogIndicators = [
-        '//*[contains(@text, "Is this OK")]',
-        '//*[contains(@text, "OK")]',
-        '//*[@resource-id="android:id/button1"]', // Standard Android OK button
-        '//android.widget.Button[@text="OK"]',
-      ];
-      
-      for (const indicator of dialogIndicators) {
-        try {
-          const elem = await driver.$(indicator);
-          const exists = await elem.isExisting().catch(() => false);
-          if (exists) {
-            log(`✅ Found confirmation dialog! Clicking OK...`);
-            
-            // Try to find and click the OK button
-            const okSelectors = [
-              '//*[@text="OK"]',
-              '//android.widget.Button[@text="OK"]',
-              '//*[@resource-id="android:id/button1"]',
-            ];
-            
-            for (const okSelector of okSelectors) {
-              try {
-                const okButton = await driver.$(okSelector);
-                const okExists = await okButton.isExisting().catch(() => false);
-                if (okExists) {
-                  await okButton.click();
-                  log(`✅ Clicked OK button on confirmation dialog`);
-                  await this.sleep(2000);
-                  await this.saveScreenshot(driver, 'after-confirmation-ok', sessionId, log);
-                  return true;
-                }
-              } catch (e) {
-                continue;
-              }
-            }
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-      
-      log(`ℹ️ No confirmation dialog found (or already dismissed)`);
+      log(`ℹ️ No phone number confirmation dialog found after checking all methods`);
       return false;
     } catch (error: any) {
       log(`⚠️ Error checking for confirmation dialog: ${error.message}`);
@@ -880,1129 +679,9 @@ ${message}
   }
 
   /**
-   * Capture network logs from Android logcat
-   */
-  private async captureNetworkLogs(driver: any, log: (msg: string) => void, durationSeconds: number = 5): Promise<string> {
-    try {
-      log(`📡 Capturing network logs for ${durationSeconds} seconds...`);
-      
-      // Clear logcat buffer first
-      await driver.execute('mobile: shell', {
-        command: 'logcat',
-        args: ['-c'],
-      });
-      
-      // Wait for logs to accumulate
-      await this.sleep(durationSeconds * 1000);
-      
-      // Get logcat output (filter for WhatsApp and network activity)
-      const result = await driver.execute('mobile: shell', {
-        command: 'logcat',
-        args: ['-d', '-s', 'WhatsApp:V', 'NetworkController:V', 'okhttp:V', 'HttpURLConnection:V'],
-      });
-      
-      return result || '';
-    } catch (e: any) {
-      log(`⚠️ Failed to capture network logs: ${e.message}`);
-      return '';
-    }
-  }
-
-  /**
-   * Analyze logs for errors or interesting messages
-   */
-  private analyzeLogs(logs: string, log: (msg: string) => void): void {
-    if (!logs || logs.length === 0) {
-      log(`⚠️ No logs captured`);
-      return;
-    }
-    
-    log(`📊 Analyzing ${logs.length} characters of logs...`);
-    
-    const lines = logs.split('\n');
-    const errorPatterns = [
-      /error/i,
-      /fail/i,
-      /invalid/i,
-      /reject/i,
-      /denied/i,
-      /blocked/i,
-      /voip/i,
-      /virtual/i,
-      /http.*[45]\d\d/i, // HTTP 4xx or 5xx errors
-      /exception/i,
-    ];
-    
-    const interestingLines: string[] = [];
-    
-    for (const line of lines) {
-      for (const pattern of errorPatterns) {
-        if (pattern.test(line)) {
-          interestingLines.push(line);
-          break;
-        }
-      }
-    }
-    
-    if (interestingLines.length > 0) {
-      log(`\n🔍 Found ${interestingLines.length} interesting log entries:`);
-      interestingLines.slice(0, 20).forEach((line, i) => {
-        log(`  [${i + 1}] ${line.substring(0, 150)}`);
-      });
-    } else {
-      log(`✓ No obvious errors found in logs`);
-    }
-  }
-
-  /**
-   * Wait for a button to become enabled (clickable)
-   * WhatsApp may disable the NEXT button until client-side validation passes
-   */
-  private async waitForButtonEnabled(
-    driver: any, 
-    selectors: string[], 
-    maxWaitMs: number = 30000,
-    log: (msg: string) => void
-  ): Promise<{ button: any; enabled: boolean }> {
-    log(`\n⏳ ═══ WAITING FOR BUTTON TO BE ENABLED ═══`);
-    log(`⏳ Max wait time: ${maxWaitMs / 1000} seconds`);
-    
-    const startTime = Date.now();
-    let lastButton: any = null;
-    let checkCount = 0;
-    
-    while (Date.now() - startTime < maxWaitMs) {
-      checkCount++;
-      
-      for (const selector of selectors) {
-        try {
-          const button = await driver.$(selector);
-          const exists = await button.isExisting();
-          
-          if (exists) {
-            lastButton = button;
-            
-            // Check all clickability attributes
-            const enabled = await button.getAttribute('enabled').catch(() => 'true');
-            const clickable = await button.getAttribute('clickable').catch(() => 'true');
-            const displayed = await button.isDisplayed().catch(() => false);
-            
-            const isReady = enabled === 'true' && clickable === 'true' && displayed;
-            
-            if (checkCount % 5 === 1) { // Log every 5 checks
-              log(`  🔍 Check #${checkCount}: enabled=${enabled}, clickable=${clickable}, displayed=${displayed}`);
-            }
-            
-            if (isReady) {
-              log(`  ✅ Button is NOW ENABLED after ${Math.round((Date.now() - startTime) / 1000)}s!`);
-              return { button, enabled: true };
-            }
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-      
-      await this.sleep(500); // Check every 500ms
-    }
-    
-    log(`  ⚠️ Timeout: Button did not become enabled within ${maxWaitMs / 1000}s`);
-    return { button: lastButton, enabled: false };
-  }
-
-  /**
-   * Click using sendevent - lowest level touch simulation
-   * This is harder for apps to detect as automation
-   */
-  private async clickViaSendevent(
-    driver: any, 
-    x: number, 
-    y: number,
-    log: (msg: string) => void
-  ): Promise<boolean> {
-    log(`\n🎯 ═══ SENDEVENT CLICK (LOW-LEVEL) ═══`);
-    log(`📍 Coordinates: (${x}, ${y})`);
-    
-    try {
-      // First, find the correct input device for touch
-      const deviceList = await driver.execute('mobile: shell', {
-        command: 'cat',
-        args: ['/proc/bus/input/devices'],
-      }).catch(() => '');
-      
-      // Parse to find touch device (usually event1 or event2)
-      let touchDevice = '/dev/input/event1'; // Default
-      
-      if (deviceList.includes('touch') || deviceList.includes('Touch')) {
-        // Try to find the actual touch device
-        const lines = deviceList.split('\n');
-        for (let i = 0; i < lines.length; i++) {
-          if (lines[i].toLowerCase().includes('touch')) {
-            // Look for the Handlers line after this
-            for (let j = i; j < Math.min(i + 10, lines.length); j++) {
-              const match = lines[j].match(/event(\d+)/);
-              if (match) {
-                touchDevice = `/dev/input/event${match[1]}`;
-                break;
-              }
-            }
-            break;
-          }
-        }
-      }
-      
-      log(`📱 Using touch device: ${touchDevice}`);
-      
-      // Convert coordinates to touch screen resolution
-      // Most Android emulators use 32767 as max value for absolute coordinates
-      const maxCoord = 32767;
-      const screenWidth = 1080; // Typical emulator width
-      const screenHeight = 1920; // Typical emulator height
-      
-      const absX = Math.round((x / screenWidth) * maxCoord);
-      const absY = Math.round((y / screenHeight) * maxCoord);
-      
-      log(`📐 Absolute coordinates: (${absX}, ${absY})`);
-      
-      // Sendevent sequence for a tap:
-      // EV_ABS (3) ABS_MT_TRACKING_ID (57) = tracking ID
-      // EV_ABS (3) ABS_MT_POSITION_X (53) = X position
-      // EV_ABS (3) ABS_MT_POSITION_Y (54) = Y position
-      // EV_ABS (3) ABS_MT_PRESSURE (58) = pressure
-      // EV_SYN (0) SYN_REPORT (0) = sync
-      // Then release with tracking ID = -1
-      
-      const commands = [
-        // Touch down
-        `sendevent ${touchDevice} 3 57 0`,      // ABS_MT_TRACKING_ID = 0
-        `sendevent ${touchDevice} 3 53 ${absX}`, // ABS_MT_POSITION_X
-        `sendevent ${touchDevice} 3 54 ${absY}`, // ABS_MT_POSITION_Y
-        `sendevent ${touchDevice} 3 58 50`,      // ABS_MT_PRESSURE = 50
-        `sendevent ${touchDevice} 1 330 1`,      // BTN_TOUCH = 1 (down)
-        `sendevent ${touchDevice} 0 0 0`,        // SYN_REPORT
-        // Small delay for touch
-        `sleep 0.05`,
-        // Touch up
-        `sendevent ${touchDevice} 3 57 -1`,      // ABS_MT_TRACKING_ID = -1 (release)
-        `sendevent ${touchDevice} 1 330 0`,      // BTN_TOUCH = 0 (up)
-        `sendevent ${touchDevice} 0 0 0`,        // SYN_REPORT
-      ];
-      
-      // Execute as a single shell command
-      const fullCommand = commands.join(' && ');
-      
-      log(`🔧 Executing sendevent sequence...`);
-      await driver.execute('mobile: shell', {
-        command: 'sh',
-        args: ['-c', fullCommand],
-      });
-      
-      log(`✅ Sendevent click executed successfully`);
-      return true;
-      
-    } catch (e: any) {
-      log(`⚠️ Sendevent failed: ${e.message}`);
-      
-      // Fallback: try simpler approach with input tap
-      log(`🔄 Fallback: Using input tap instead...`);
-      try {
-        await driver.execute('mobile: shell', {
-          command: 'input',
-          args: ['tap', x.toString(), y.toString()],
-        });
-        log(`✅ Fallback input tap executed`);
-        return true;
-      } catch (e2: any) {
-        log(`❌ Fallback also failed: ${e2.message}`);
-        return false;
-      }
-    }
-  }
-
-  /**
-   * Alternative: Click using input touchscreen swipe (duration=0 = tap)
-   * Another low-level approach that can bypass some detection
-   */
-  private async clickViaInputSwipe(
-    driver: any,
-    x: number,
-    y: number,
-    log: (msg: string) => void
-  ): Promise<boolean> {
-    log(`\n🖱️ ═══ INPUT SWIPE TAP ═══`);
-    log(`📍 Coordinates: (${x}, ${y})`);
-    
-    try {
-      // swipe from point to same point with 0 duration = tap
-      await driver.execute('mobile: shell', {
-        command: 'input',
-        args: ['touchscreen', 'swipe', x.toString(), y.toString(), x.toString(), y.toString(), '50'],
-      });
-      log(`✅ Input swipe tap executed`);
-      return true;
-    } catch (e: any) {
-      log(`⚠️ Input swipe tap failed: ${e.message}`);
-      return false;
-    }
-  }
-
-  /**
-   * W3C Actions API - Most modern and reliable method
-   * Uses performActions which is the new standard
-   */
-  private async clickViaW3CActions(
-    driver: any,
-    x: number,
-    y: number,
-    log: (msg: string) => void
-  ): Promise<boolean> {
-    log(`\n🎭 ═══ W3C ACTIONS API (MOST RELIABLE) ═══`);
-    log(`📍 Coordinates: (${x}, ${y})`);
-    
-    try {
-      // W3C Actions API - creates a pointer action sequence
-      const actions = [
-        {
-          type: 'pointer',
-          id: 'finger1',
-          parameters: { pointerType: 'touch' },
-          actions: [
-            { type: 'pointerMove', duration: 0, x: Math.round(x), y: Math.round(y) },
-            { type: 'pointerDown', button: 0 },
-            { type: 'pause', duration: 100 }, // Hold for 100ms
-            { type: 'pointerUp', button: 0 },
-          ]
-        }
-      ];
-      
-      log(`🔧 Executing W3C pointer action sequence...`);
-      await driver.performActions(actions);
-      log(`✅ W3C Actions executed successfully`);
-      
-      // Clean up actions
-      await driver.releaseActions().catch(() => {});
-      
-      return true;
-    } catch (e: any) {
-      log(`⚠️ W3C Actions failed: ${e.message}`);
-      return false;
-    }
-  }
-
-  /**
-   * JavaScript injection - Force click via JavaScript
-   * Most reliable as it bypasses all touch layer issues
-   */
-  private async clickViaJavaScript(
-    driver: any,
-    button: any,
-    log: (msg: string) => void
-  ): Promise<boolean> {
-    log(`\n💉 ═══ JAVASCRIPT INJECTION (FORCE CLICK) ═══`);
-    
-    try {
-      // Get the element's Android view ID
-      const viewId = await button.getAttribute('resource-id').catch(() => null);
-      
-      if (viewId) {
-        log(`📱 Attempting to trigger click event via JavaScript on ${viewId}...`);
-        
-        // Try to execute JavaScript to simulate a click
-        // Note: This might not work on all Android versions
-        await driver.execute('mobile: shell', {
-          command: 'input',
-          args: ['keyevent', '23'], // KEYCODE_DPAD_CENTER - simulates center button press
-        });
-        
-        log(`✅ JavaScript injection executed`);
-        return true;
-      } else {
-        log(`⚠️ Could not get element resource-id for JavaScript injection`);
-        return false;
-      }
-    } catch (e: any) {
-      log(`⚠️ JavaScript injection failed: ${e.message}`);
-      return false;
-    }
-  }
-
-  /**
-   * Longpress then release - Sometimes more reliable than tap
-   */
-  private async clickViaLongpress(
-    driver: any,
-    x: number,
-    y: number,
-    log: (msg: string) => void
-  ): Promise<boolean> {
-    log(`\n⏱️ ═══ LONGPRESS METHOD ═══`);
-    log(`📍 Coordinates: (${x}, ${y})`);
-    
-    try {
-      // Use touchAction with longPress
-      await driver.touchAction([
-        { action: 'longPress', x: Math.round(x), y: Math.round(y) },
-        { action: 'release' }
-      ]);
-      log(`✅ Longpress executed`);
-      return true;
-    } catch (e: any) {
-      log(`⚠️ Longpress failed: ${e.message}`);
-      return false;
-    }
-  }
-
-  private async tryEverythingToMoveToNextPage(driver: any, log: (msg: string) => void, sessionId: string): Promise<boolean> {
-    log(`🚀 SOLUTION AMÉLIORÉE: ATTENTE BOUTON ENABLED + CLICS BAS NIVEAU`);
-    
-    const activityBefore = await driver.getCurrentActivity();
-    log(`📱 Starting activity: ${activityBefore}`);
-    
-    // Selectors for NEXT button
-    const nextButtonSelectors = [
-      `//android.widget.Button[@text="NEXT"]`,
-      `//*[@text="NEXT"]`,
-      `//*[@resource-id="com.whatsapp:id/registration_submit"]`,
-      `//android.widget.Button[contains(@text, "Next")]`,
-      `//*[contains(@text, "NEXT")]`,
-    ];
-    
-    // ═══════════════════════════════════════════════════════════════
-    // SOLUTION #0: ATTENDRE QUE LE BOUTON SOIT ENABLED (NOUVEAU!)
-    // ═══════════════════════════════════════════════════════════════
-    log(`\n🆕 ═══ SOLUTION #0: ATTENTE BOUTON ENABLED ═══`);
-    log(`💡 WhatsApp peut désactiver le bouton NEXT tant que le numéro n'est pas validé`);
-    
-    const { button: enabledButton, enabled } = await this.waitForButtonEnabled(
-      driver, 
-      nextButtonSelectors, 
-      30000, // Max 30 seconds
-      log
-    );
-    
-    if (enabled && enabledButton) {
-      log(`✅ Le bouton est maintenant ENABLED - tentative de clic immédiat`);
-      
-      // Try clicking immediately while it's enabled
-      try {
-        await enabledButton.click();
-        log(`✅ Clic direct sur bouton enabled`);
-        await this.sleep(2000);
-        
-        // Check if page changed
-        const activityAfter = await driver.getCurrentActivity();
-        if (activityAfter !== activityBefore) {
-          log(`✅ ✅ ✅ PAGE CHANGED après clic sur bouton enabled!`);
-          await this.saveScreenshot(driver, 'success-enabled-click', sessionId, log);
-          return true;
-        }
-      } catch (e: any) {
-        log(`⚠️ Clic sur bouton enabled échoué: ${e.message}`);
-      }
-    } else {
-      log(`⚠️ Le bouton n'est pas devenu enabled dans le délai - on continue avec les autres méthodes`);
-    }
-    
-    // ═══════════════════════════════════════════════════════════════
-    // SOLUTION #1: ATTENTE PROLONGÉE (15 secondes au lieu de 5)
-    // ═══════════════════════════════════════════════════════════════
-    log(`\n⏳ ═══ SOLUTION #1: ATTENTE PROLONGÉE ═══`);
-    log(`⏳ Waiting 15 seconds for WhatsApp client-side validation...`);
-    log(`💡 WhatsApp may be validating the number format, carrier, country code, etc.`);
-    await this.sleep(15000);
-    log(`✅ 15 seconds elapsed - validation should be complete`);
-    
-    // ═══════════════════════════════════════════════════════════════
-    // SOLUTION #2: PERDRE LE FOCUS DU CHAMP
-    // ═══════════════════════════════════════════════════════════════
-    log(`\n👆 ═══ SOLUTION #2: PERTE DE FOCUS ═══`);
-    log(`👆 Clicking elsewhere to remove focus from phone number field...`);
-    
-    try {
-      // Click on the title "Enter your phone number" to lose focus
-      const titleSelectors = [
-        '//*[@text="Enter your phone number"]',
-        '//*[contains(@text, "Enter your")]',
-        '//*[@resource-id="com.whatsapp:id/registration_text"]',
-      ];
-      
-      let focusLost = false;
-      for (const selector of titleSelectors) {
-        try {
-          const titleElement = await driver.$(selector);
-          const exists = await titleElement.isExisting();
-          if (exists) {
-            log(`✅ Found title element, clicking to lose focus...`);
-            await titleElement.click();
-            focusLost = true;
-            log(`✅ Clicked on title - focus should be lost from input field`);
-            break;
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-      
-      if (!focusLost) {
-        // Fallback: click on empty space (top of screen)
-        log(`⚠️ Title not found, clicking on empty space instead...`);
-        await driver.touchAction([
-          { action: 'tap', x: 540, y: 300 }
-        ]);
-        log(`✅ Clicked on empty space - focus should be lost`);
-      }
-      
-      await this.sleep(2000);
-    } catch (e: any) {
-      log(`⚠️ Could not lose focus: ${e.message}`);
-    }
-    
-    // Hide keyboard
-    log(`\n⌨️ Hiding keyboard...`);
-    try {
-      await driver.hideKeyboard().catch(() => {});
-      await driver.pressKeyCode(4); // KEYCODE_BACK to hide keyboard
-      await this.sleep(1000);
-      log(`✅ Keyboard hidden`);
-    } catch (e: any) {
-      log(`⚠️ Could not hide keyboard: ${e.message}`);
-    }
-    
-    // Additional wait after losing focus
-    log(`\n⏳ Waiting 3 additional seconds after losing focus...`);
-    await this.sleep(3000);
-    log(`✅ Ready to click Next button`);
-    
-    // ═══════════════════════════════════════════════════════════════
-    // START NETWORK CAPTURE
-    // ═══════════════════════════════════════════════════════════════
-    log(`\n📡 ═══ DÉMARRAGE CAPTURE RÉSEAU ═══`);
-    
-    // Clear logcat before starting
-    try {
-      await driver.execute('mobile: shell', {
-        command: 'logcat',
-        args: ['-c'],
-      });
-      log(`✅ Logcat buffer cleared`);
-    } catch (e: any) {
-      log(`⚠️ Could not clear logcat: ${e.message}`);
-    }
-    
-    // ═══════════════════════════════════════════════════════════════
-    // ÉTAPE 1: DIAGNOSTIC APPROFONDI
-    // ═══════════════════════════════════════════════════════════════
-    log(`\n🔍 ═══ ÉTAPE 1: DIAGNOSTIC COMPLET ═══`);
-    
-    try {
-      // 1.1 - Dump complete page source XML
-      log(`📄 Dumping complete page source XML...`);
-      const pageSource = await driver.getPageSource();
-      log(`📄 Page source length: ${pageSource.length} characters`);
-      
-      // Save to file (truncate if too long for logs)
-      if (pageSource.length < 5000) {
-        log(`📄 Page Source (truncated):\n${pageSource.substring(0, 2000)}...`);
-      }
-      
-      // 1.2 - Find and analyze NEXT button
-      log(`\n🔍 Analyzing NEXT button attributes...`);
-      const selectors = [
-        `//android.widget.Button[@text="NEXT"]`,
-        `//*[@text="NEXT"]`,
-        `//*[@resource-id="com.whatsapp:id/registration_submit"]`,
-      ];
-      
-      let nextButton: any = null;
-      let usedSelector = '';
-      
-      for (const selector of selectors) {
-        try {
-          const btn = await driver.$(selector);
-          const exists = await btn.isExisting();
-          if (exists) {
-            nextButton = btn;
-            usedSelector = selector;
-            log(`✅ Found NEXT button with selector: ${selector}`);
-            break;
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-      
-      if (nextButton) {
-        // Read ALL attributes
-        log(`\n📊 NEXT Button Attributes:`);
-        try {
-          const attributes = {
-            text: await nextButton.getText().catch(() => 'N/A'),
-            displayed: await nextButton.isDisplayed().catch(() => 'N/A'),
-            enabled: await nextButton.isEnabled().catch(() => 'N/A'),
-            clickable: await nextButton.getAttribute('clickable').catch(() => 'N/A'),
-            focusable: await nextButton.getAttribute('focusable').catch(() => 'N/A'),
-            focused: await nextButton.getAttribute('focused').catch(() => 'N/A'),
-            selected: await nextButton.getAttribute('selected').catch(() => 'N/A'),
-            bounds: await nextButton.getAttribute('bounds').catch(() => 'N/A'),
-            resourceId: await nextButton.getAttribute('resource-id').catch(() => 'N/A'),
-            className: await nextButton.getAttribute('class').catch(() => 'N/A'),
-            package: await nextButton.getAttribute('package').catch(() => 'N/A'),
-            contentDesc: await nextButton.getAttribute('content-desc').catch(() => 'N/A'),
-          };
-          
-          for (const [key, value] of Object.entries(attributes)) {
-            log(`  • ${key}: ${value}`);
-          }
-          
-          // Check for overlays
-          log(`\n🔍 Checking for overlays or blocking elements...`);
-          const allElements = await driver.$$('//*[@displayed="true"]');
-          log(`  • Total visible elements: ${allElements.length}`);
-          
-          // Get button coordinates
-          const location = await nextButton.getLocation().catch(() => ({ x: 0, y: 0 }));
-          const size = await nextButton.getSize().catch(() => ({ width: 0, height: 0 }));
-          log(`  • Button location: (${location.x}, ${location.y})`);
-          log(`  • Button size: ${size.width}x${size.height}`);
-          
-        } catch (e: any) {
-          log(`⚠️ Error reading button attributes: ${e.message}`);
-        }
-      } else {
-        log(`❌ NEXT button not found!`);
-      }
-      
-      await this.saveScreenshot(driver, 'diagnostic-before-click', sessionId, log);
-      
-    } catch (e: any) {
-      log(`⚠️ Diagnostic error: ${e.message}`);
-    }
-    
-    // ═══════════════════════════════════════════════════════════════
-    // ÉTAPE 2: UIAUTOMATOR2 + MULTIPLE CLICK METHODS
-    // ═══════════════════════════════════════════════════════════════
-    log(`\n🤖 ═══ ÉTAPE 2: MÉTHODES DE CLIC AVANCÉES (20 méthodes!) ═══`);
-    
-    const maxAttempts = 40; // 2 passes complètes de 20 méthodes
-    const clickMethods = [
-      'w3c_actions', // 1. W3C Actions API - MOST RELIABLE
-      'longpress', // 2. Longpress method
-      'standard', // 3. Standard Appium click
-      'uiautomator2', // 4. UIAutomator2 direct
-      'coordinates', // 5. ADB input tap
-      'gesture', // 6. Mobile gesture
-      'ime_action', // 7. IME action (submit form)
-      'sendevent', // 8. Low-level kernel touch events
-      'inputswipe', // 9. Input swipe tap
-      'javascript', // 10. JavaScript injection
-      'double_tap', // 11. Double tap rapide
-      'triple_tap', // 12. Triple tap
-      'long_hold', // 13. Press and hold 2 seconds
-      'offset_tap', // 14. Tap with offset (slightly moved)
-      'mini_swipe', // 15. Mini swipe on button
-      'monkey_tap', // 16. ADB monkey tap
-      'uiautomator_shell', // 17. UIAutomator shell command
-      'rapid_taps', // 18. Multiple rapid taps (5x)
-      'circular_gesture', // 19. Circular gesture on button
-      'keyevent_enter', // 20. Multiple ENTER key events
-    ];
-    
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      log(`\n🔄 ═══ Attempt ${attempt}/${maxAttempts} ═══`);
-      
-      // Rotate through different click methods
-      const methodIndex = (attempt - 1) % clickMethods.length;
-      const method = clickMethods[methodIndex];
-      log(`📍 Using method: ${method.toUpperCase()}`);
-      
-      // Find the NEXT button
-      const selectors = [
-        `//android.widget.Button[@text="NEXT"]`,
-        `//*[@text="NEXT"]`,
-        `//*[@resource-id="com.whatsapp:id/registration_submit"]`,
-      ];
-      
-      let buttonClicked = false;
-      let nextButton: any = null;
-      
-      // Find button
-      for (const selector of selectors) {
-        try {
-          const button = await driver.$(selector);
-          const exists = await button.isExisting();
-          if (exists && await button.isDisplayed().catch(() => false)) {
-            nextButton = button;
-            log(`  ✅ Found NEXT button: ${selector}`);
-            break;
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-      
-      if (!nextButton) {
-        log(`  ❌ NEXT button not found on attempt ${attempt}`);
-        await this.sleep(3000);
-        continue;
-      }
-      
-      // Try different click methods based on the current method
-      try {
-        if (method === 'w3c_actions') {
-          // METHOD 0: W3C Actions API (MOST RELIABLE!)
-          log(`  🎭 METHOD 0: W3C Actions API (most modern)`);
-          const location = await nextButton.getLocation();
-          const size = await nextButton.getSize();
-          const x = Math.round(location.x + (size.width / 2));
-          const y = Math.round(location.y + (size.height / 2));
-          buttonClicked = await this.clickViaW3CActions(driver, x, y, log);
-          
-        } else if (method === 'longpress') {
-          // METHOD 0.5: Longpress (sometimes more reliable)
-          log(`  ⏱️ METHOD 0.5: Longpress method`);
-          const location = await nextButton.getLocation();
-          const size = await nextButton.getSize();
-          const x = Math.round(location.x + (size.width / 2));
-          const y = Math.round(location.y + (size.height / 2));
-          buttonClicked = await this.clickViaLongpress(driver, x, y, log);
-          
-        } else if (method === 'standard') {
-          // METHOD 1: Standard Appium click
-          log(`  🖱️ METHOD 1: Standard Appium click()`);
-          await nextButton.click();
-          buttonClicked = true;
-          
-        } else if (method === 'uiautomator2') {
-          // METHOD 2: UIAutomator2 direct
-          log(`  🤖 METHOD 2: UIAutomator2 direct via mobile:clickGesture`);
-          try {
-            await driver.execute('mobile: clickGesture', {
-              elementId: nextButton.elementId,
-            });
-            buttonClicked = true;
-          } catch (gestureErr: any) {
-            log(`  ⚠️ clickGesture failed: ${gestureErr.message}`);
-            // Fallback: Try with coordinates
-            const location = await nextButton.getLocation();
-            const size = await nextButton.getSize();
-            const x = location.x + (size.width / 2);
-            const y = location.y + (size.height / 2);
-            log(`  🎯 Fallback: Clicking at (${Math.round(x)}, ${Math.round(y)})`);
-            await driver.execute('mobile: clickGesture', {
-              x: Math.round(x),
-              y: Math.round(y),
-            });
-            buttonClicked = true;
-          }
-          
-        } else if (method === 'coordinates') {
-          // METHOD 3: ADB input tap (coordinates)
-          log(`  📍 METHOD 3: ADB input tap (coordinates)`);
-          const location = await nextButton.getLocation();
-          const size = await nextButton.getSize();
-          const x = Math.round(location.x + (size.width / 2));
-          const y = Math.round(location.y + (size.height / 2));
-          log(`  🎯 Tapping at (${x}, ${y})`);
-          
-          await driver.execute('mobile: shell', {
-            command: 'input',
-            args: ['tap', x.toString(), y.toString()],
-          });
-          buttonClicked = true;
-          
-        } else if (method === 'gesture') {
-          // METHOD 4: Touch gesture with press-wait-release
-          log(`  ✋ METHOD 4: Touch gesture (press-wait-release)`);
-          const location = await nextButton.getLocation();
-          const size = await nextButton.getSize();
-          const x = Math.round(location.x + (size.width / 2));
-          const y = Math.round(location.y + (size.height / 2));
-          
-          await driver.touchAction([
-            { action: 'press', x, y },
-            { action: 'wait', ms: 100 },
-            { action: 'release' }
-          ]);
-          buttonClicked = true;
-          
-        } else if (method === 'ime_action') {
-          // METHOD 5: IME action (submit form via keyboard)
-          log(`  ⌨️ METHOD 5: IME action (submit via keyboard)`);
-          // Try pressing ENTER to submit the form
-          await driver.pressKeyCode(66); // KEYCODE_ENTER
-          buttonClicked = true;
-          
-        } else if (method === 'sendevent') {
-          // METHOD 6: Sendevent - low-level kernel touch events (NOUVEAU!)
-          log(`  🎯 METHOD 6: Sendevent (low-level kernel events)`);
-          const location = await nextButton.getLocation();
-          const size = await nextButton.getSize();
-          const x = Math.round(location.x + (size.width / 2));
-          const y = Math.round(location.y + (size.height / 2));
-          buttonClicked = await this.clickViaSendevent(driver, x, y, log);
-          
-        } else if (method === 'inputswipe') {
-          // METHOD 7: Input swipe tap
-          log(`  🖱️ METHOD 7: Input swipe tap`);
-          const location = await nextButton.getLocation();
-          const size = await nextButton.getSize();
-          const x = Math.round(location.x + (size.width / 2));
-          const y = Math.round(location.y + (size.height / 2));
-          buttonClicked = await this.clickViaInputSwipe(driver, x, y, log);
-          
-        } else if (method === 'javascript') {
-          // METHOD 10: JavaScript injection
-          log(`  💉 METHOD 10: JavaScript injection (force click)`);
-          buttonClicked = await this.clickViaJavaScript(driver, nextButton, log);
-          
-        } else if (method === 'double_tap') {
-          // METHOD 11: Double tap rapide
-          log(`  👆👆 METHOD 11: Double tap`);
-          const location = await nextButton.getLocation();
-          const size = await nextButton.getSize();
-          const x = Math.round(location.x + (size.width / 2));
-          const y = Math.round(location.y + (size.height / 2));
-          await driver.execute('mobile: shell', {
-            command: 'input',
-            args: ['tap', x.toString(), y.toString()],
-          });
-          await this.sleep(50);
-          await driver.execute('mobile: shell', {
-            command: 'input',
-            args: ['tap', x.toString(), y.toString()],
-          });
-          buttonClicked = true;
-          
-        } else if (method === 'triple_tap') {
-          // METHOD 12: Triple tap
-          log(`  👆👆👆 METHOD 12: Triple tap`);
-          const location = await nextButton.getLocation();
-          const size = await nextButton.getSize();
-          const x = Math.round(location.x + (size.width / 2));
-          const y = Math.round(location.y + (size.height / 2));
-          for (let i = 0; i < 3; i++) {
-            await driver.execute('mobile: shell', {
-              command: 'input',
-              args: ['tap', x.toString(), y.toString()],
-            });
-            await this.sleep(50);
-          }
-          buttonClicked = true;
-          
-        } else if (method === 'long_hold') {
-          // METHOD 13: Long press and hold 2 seconds
-          log(`  ⏱️⏱️ METHOD 13: Long hold (2 seconds)`);
-          const location = await nextButton.getLocation();
-          const size = await nextButton.getSize();
-          const x = Math.round(location.x + (size.width / 2));
-          const y = Math.round(location.y + (size.height / 2));
-          await driver.touchAction([
-            { action: 'press', x, y },
-            { action: 'wait', ms: 2000 },
-            { action: 'release' }
-          ]);
-          buttonClicked = true;
-          
-        } else if (method === 'offset_tap') {
-          // METHOD 14: Tap with slight offset
-          log(`  📍➡️ METHOD 14: Tap with offset`);
-          const location = await nextButton.getLocation();
-          const size = await nextButton.getSize();
-          const x = Math.round(location.x + (size.width / 2) + 10); // +10px offset
-          const y = Math.round(location.y + (size.height / 2) + 5); // +5px offset
-          await driver.execute('mobile: shell', {
-            command: 'input',
-            args: ['tap', x.toString(), y.toString()],
-          });
-          buttonClicked = true;
-          
-        } else if (method === 'mini_swipe') {
-          // METHOD 15: Mini swipe on button
-          log(`  👉 METHOD 15: Mini swipe on button`);
-          const location = await nextButton.getLocation();
-          const size = await nextButton.getSize();
-          const x = Math.round(location.x + (size.width / 2));
-          const y = Math.round(location.y + (size.height / 2));
-          await driver.execute('mobile: shell', {
-            command: 'input',
-            args: ['swipe', x.toString(), y.toString(), (x + 10).toString(), y.toString(), '100'],
-          });
-          buttonClicked = true;
-          
-        } else if (method === 'monkey_tap') {
-          // METHOD 16: ADB monkey tap
-          log(`  🐵 METHOD 16: ADB monkey tap`);
-          const location = await nextButton.getLocation();
-          const size = await nextButton.getSize();
-          const x = Math.round(location.x + (size.width / 2));
-          const y = Math.round(location.y + (size.height / 2));
-          await driver.execute('mobile: shell', {
-            command: 'monkey',
-            args: ['--pct-touch', '100', '-p', 'com.whatsapp', '--throttle', '100', '1'],
-          });
-          // Follow with direct tap
-          await this.sleep(100);
-          await driver.execute('mobile: shell', {
-            command: 'input',
-            args: ['tap', x.toString(), y.toString()],
-          });
-          buttonClicked = true;
-          
-        } else if (method === 'uiautomator_shell') {
-          // METHOD 17: UIAutomator shell command
-          log(`  🤖📟 METHOD 17: UIAutomator shell command`);
-          try {
-            await driver.execute('mobile: shell', {
-              command: 'uiautomator',
-              args: ['runtest', 'dummy.jar', '-c', 'com.android.commands.uiautomator.Launcher'],
-            });
-          } catch (e: any) {
-            log(`  ⚠️ UIAutomator shell not available, falling back to coordinates`);
-          }
-          // Fallback to tap
-          const location = await nextButton.getLocation();
-          const size = await nextButton.getSize();
-          const x = Math.round(location.x + (size.width / 2));
-          const y = Math.round(location.y + (size.height / 2));
-          await driver.execute('mobile: shell', {
-            command: 'input',
-            args: ['tap', x.toString(), y.toString()],
-          });
-          buttonClicked = true;
-          
-        } else if (method === 'rapid_taps') {
-          // METHOD 18: Multiple rapid taps
-          log(`  ⚡⚡⚡ METHOD 18: Rapid taps (5x)`);
-          const location = await nextButton.getLocation();
-          const size = await nextButton.getSize();
-          const x = Math.round(location.x + (size.width / 2));
-          const y = Math.round(location.y + (size.height / 2));
-          for (let i = 0; i < 5; i++) {
-            await driver.execute('mobile: shell', {
-              command: 'input',
-              args: ['tap', x.toString(), y.toString()],
-            });
-            await this.sleep(20);
-          }
-          buttonClicked = true;
-          
-        } else if (method === 'circular_gesture') {
-          // METHOD 19: Circular gesture on button
-          log(`  🔄 METHOD 19: Circular gesture`);
-          const location = await nextButton.getLocation();
-          const size = await nextButton.getSize();
-          const centerX = Math.round(location.x + (size.width / 2));
-          const centerY = Math.round(location.y + (size.height / 2));
-          const radius = Math.min(size.width, size.height) / 4;
-          
-          // Draw small circle and end with tap
-          for (let angle = 0; angle <= 360; angle += 90) {
-            const rad = (angle * Math.PI) / 180;
-            const x = Math.round(centerX + radius * Math.cos(rad));
-            const y = Math.round(centerY + radius * Math.sin(rad));
-            await driver.touchAction([
-              { action: 'press', x, y },
-              { action: 'wait', ms: 10 },
-              { action: 'release' }
-            ]);
-          }
-          // Final tap at center
-          await driver.execute('mobile: shell', {
-            command: 'input',
-            args: ['tap', centerX.toString(), centerY.toString()],
-          });
-          buttonClicked = true;
-          
-        } else if (method === 'keyevent_enter') {
-          // METHOD 20: Multiple ENTER key events
-          log(`  ⌨️⌨️⌨️ METHOD 20: Multiple ENTER keys`);
-          for (let i = 0; i < 3; i++) {
-            await driver.pressKeyCode(66); // KEYCODE_ENTER
-            await this.sleep(100);
-          }
-          // Also try DPAD_CENTER
-          await driver.pressKeyCode(23); // KEYCODE_DPAD_CENTER
-          buttonClicked = true;
-        }
-        
-        if (buttonClicked) {
-          log(`  ✅ Click executed with method: ${method}`);
-        }
-        
-      } catch (clickErr: any) {
-        log(`  ❌ Click failed with ${method}: ${clickErr.message}`);
-      }
-      
-      // Wait and check for results
-      await this.sleep(2000);
-      
-      // ═══════════════════════════════════════════════════════════════
-      // CAPTURE NETWORK LOGS AFTER CLICK
-      // ═══════════════════════════════════════════════════════════════
-      log(`  📡 Capturing network logs after click...`);
-      try {
-        const networkLogs = await driver.execute('mobile: shell', {
-          command: 'logcat',
-          args: ['-d', '-v', 'time', '-s', 'WhatsApp:*', '*:E'],
-          timeout: 5000,
-        }).catch(() => '');
-        
-        if (networkLogs && networkLogs.length > 100) {
-          log(`  📊 Captured ${networkLogs.length} chars of logs`);
-          
-          // Look for errors or interesting patterns
-          const lines = networkLogs.split('\n').slice(-30); // Last 30 lines
-          const errorLines = lines.filter((line: string) => 
-            /error|fail|invalid|reject|denied|blocked|exception|http.*[45]\d\d/i.test(line)
-          );
-          
-          if (errorLines.length > 0) {
-            log(`  🔴 Found ${errorLines.length} potential error(s):`);
-            errorLines.slice(0, 5).forEach((line: string, i: number) => {
-              log(`    [${i + 1}] ${line.trim().substring(0, 120)}`);
-            });
-          } else {
-            log(`  ✓ No obvious errors in network logs`);
-          }
-        }
-      } catch (e: any) {
-        log(`  ⚠️ Could not capture network logs: ${e.message}`);
-      }
-      
-      // Check for confirmation dialog
-      log(`  🔍 Checking for confirmation dialog...`);
-      const dialogFound = await this.handleConfirmationDialog(driver, log, sessionId);
-      if (dialogFound) {
-        log(`  ✅ Confirmation dialog handled!`);
-      }
-      
-      await this.sleep(1000);
-      
-      // Check if page changed
-      const newActivity = await driver.getCurrentActivity();
-      log(`  📱 Activity after click: ${newActivity}`);
-      
-      if (newActivity !== activityBefore && !newActivity.includes('RegisterPhone')) {
-        log(`\n✅✅✅ SUCCESS! Page changed after ${attempt} attempt(s) using ${method}!`);
-        log(`✅ New activity: ${newActivity}`);
-        await this.saveScreenshot(driver, '06-success-next-button', sessionId, log);
-        return true;
-      } else {
-        log(`  ⚠️ Page didn't change yet...`);
-      }
-      
-      // Wait 3 seconds before next attempt (unless it's the last one)
-      if (attempt < maxAttempts) {
-        log(`  ⏳ Waiting 3 seconds before next attempt...`);
-        await this.sleep(3000);
-      }
-    }
-    
-    // ═══════════════════════════════════════════════════════════════
-    // FINAL NETWORK ANALYSIS
-    // ═══════════════════════════════════════════════════════════════
-    log(`\n❌ Failed to click NEXT button after ${maxAttempts} attempts with all methods`);
-    log(`\n📡 ═══ ANALYSE RÉSEAU FINALE ═══`);
-    
-    try {
-      log(`📡 Capturing comprehensive network logs...`);
-      const fullLogs = await driver.execute('mobile: shell', {
-        command: 'logcat',
-        args: ['-d', '-v', 'time'],
-        timeout: 10000,
-      }).catch(() => '');
-      
-      if (fullLogs && fullLogs.length > 0) {
-        log(`📊 Total logs captured: ${fullLogs.length} characters`);
-        
-        // Analyze for WhatsApp specific errors
-        const whatsappLines = fullLogs.split('\n').filter((line: string) => 
-          line.includes('whatsapp') || line.includes('WhatsApp')
-        );
-        log(`📱 WhatsApp-related log lines: ${whatsappLines.length}`);
-        
-        // Look for network errors
-        const networkErrors = whatsappLines.filter((line: string) =>
-          /error|fail|invalid|reject|denied|blocked|voip|virtual|400|401|403|404|500|502|503/i.test(line)
-        );
-        
-        if (networkErrors.length > 0) {
-          log(`\n🔴 FOUND ${networkErrors.length} NETWORK ERRORS OR REJECTIONS:`);
-          networkErrors.slice(0, 10).forEach((line: string, i: number) => {
-            log(`  [${i + 1}] ${line.trim()}`);
-          });
-        } else {
-          log(`\n✅ No network errors found in logs`);
-        }
-        
-        // Look for HTTP requests
-        const httpRequests = whatsappLines.filter((line: string) =>
-          /http|https|request|response|post|get/i.test(line)
-        );
-        
-        if (httpRequests.length > 0) {
-          log(`\n📡 HTTP Requests found: ${httpRequests.length}`);
-          httpRequests.slice(-10).forEach((line: string, i: number) => {
-            log(`  [${i + 1}] ${line.trim().substring(0, 150)}`);
-          });
-        }
-        
-      } else {
-        log(`⚠️ Could not capture comprehensive logs`);
-      }
-    } catch (e: any) {
-      log(`⚠️ Error capturing final network logs: ${e.message}`);
-    }
-    
-    // ═══════════════════════════════════════════════════════════════
-    // ÉTAPE 3: INSTRUCTIONS POUR TEST MANUEL VNC
-    // ═══════════════════════════════════════════════════════════════
-    log(`\n📋 ═══ ÉTAPE 3: TEST MANUEL REQUIS ═══`);
-    log(`\n🔧 Pour déboguer manuellement via VNC:`);
-    log(`1. Connectez-vous à l'émulateur via VNC (port visible dans les logs Docker)`);
-    log(`2. Essayez de cliquer MANUELLEMENT sur le bouton NEXT`);
-    log(`3. Observez ce qui se passe:`);
-    log(`   - Le bouton répond-il au clic manuel ?`);
-    log(`   - Un dialogue de confirmation apparaît-il ?`);
-    log(`   - Un message d'erreur s'affiche-t-il ?`);
-    log(`4. Si le bouton ne fonctionne PAS manuellement:`);
-    log(`   → WhatsApp bloque probablement les numéros virtuels (VoIP)`);
-    log(`   → Solution: Utiliser des vrais numéros SIM ou une autre source`);
-    log(`5. Si le bouton FONCTIONNE manuellement:`);
-    log(`   → C'est un problème avec Appium/UIAutomator2`);
-    log(`   → Contactez le support ou essayez une version différente de WhatsApp`);
-    log(`\n📊 Résumé des méthodes testées:`);
-    log(`  ✓ Standard Appium click() - ÉCHOUÉ`);
-    log(`  ✓ UIAutomator2 clickGesture - ÉCHOUÉ`);
-    log(`  ✓ ADB input tap coordinates - ÉCHOUÉ`);
-    log(`  ✓ Touch gesture press-release - ÉCHOUÉ`);
-    log(`  ✓ IME keyboard action (ENTER) - ÉCHOUÉ`);
-    log(`\n💡 Diagnostic disponible dans les screenshots précédents`);
-    
-    await this.saveScreenshot(driver, 'final-stuck-on-register-phone', sessionId, log);
-    await this.saveScreenshot(driver, '06-all-methods-exhausted', sessionId, log);
-    return false;
-  }
-
-  /**
-   * Click Next button and verify page changed
-   * Returns true if page changed successfully, false otherwise
-   */
-  private async clickNextAndVerifyPageChange(driver: any, log: (msg: string) => void, sessionId: string): Promise<boolean> {
-    this.logStep(WhatsAppStep.CLICKING_NEXT, 'Attempting to click Next button and verify page change', log);
-    
-    // Get current activity before clicking
-    const activityBefore = await driver.getCurrentActivity();
-    log(`📱 Current activity BEFORE click: ${activityBefore}`);
-    
-    // TRY EVERYTHING - aggressive approach
-    return await this.tryEverythingToMoveToNextPage(driver, log, sessionId);
-  }
-
-  /**
    * Enter phone number in WhatsApp registration screen
    */
-  private async enterPhoneNumber(driver: any, phoneNumber: string, countryName?: string, onLog?: (msg: string) => void, sessionId?: string): Promise<void> {
+  private async enterPhoneNumber(driver: any, phoneNumber: string, countryName?: string, onLog?: (msg: string) => void, sessionId?: string, vncPort?: number, containerId?: string): Promise<void> {
     const log = (msg: string) => {
       logger.info(msg);
       console.log(`🤖 [WHATSAPP-AUTO] ${msg}`);
@@ -2290,7 +969,7 @@ ${message}
       if (countryName) {
         log(`🌍 Country: "${countryName}" (code: +${countryCode})`);
         log(`ℹ️ Skipping dropdown selection - WhatsApp will auto-detect from country code`);
-        if (sessionId) await this.saveScreenshot(driver, 'before-phone-entry', sessionId, log);
+        if (sessionId) await this.saveScreenshot(driver, 'before-phone-entry', sessionId);
       }
 
       // Find country code field and phone number field separately
@@ -2449,25 +1128,567 @@ ${message}
         
         log(`📸 Taking screenshot after entering phone number...`);
         await this.saveScreenshot(driver, '05-after-phone-entry', sessionId || 'unknown');
+        await this.logPageSource(driver, '05-after-phone-entry', sessionId || 'unknown');
+
+        // Check for confirmation dialog "Is this the correct number?" first
+        log(`🔍 [STEP 5a] Checking for phone number confirmation dialog...`);
+        const confirmationDismissed = await this.handlePhoneConfirmationDialog(driver, log, sessionId || 'unknown');
         
-        // NEW METHODOLOGY: Click Next button and verify page changed
-        this.logStep(WhatsAppStep.PHONE_NUMBER_ENTRY, 'Phone number entered successfully', onLog);
-        
-        const pageChanged = await this.clickNextAndVerifyPageChange(driver, log, sessionId || 'unknown');
-        
-        if (pageChanged) {
-          this.logStep(WhatsAppStep.WAITING_FOR_SMS_SCREEN, 'Successfully moved to SMS waiting screen. Ready to receive SMS.', onLog);
-          log(`✅ ✅ ✅ SUCCESS: Phone number submitted and page changed!`);
-          await this.saveScreenshot(driver, '07-ready-for-sms', sessionId || 'unknown');
-          return; // SMS request has been sent, page changed successfully
-        } else {
-          // Page didn't change - this is a CRITICAL ERROR
-          log(`❌ ❌ ❌ CRITICAL ERROR: Could not submit phone number - page did not change!`);
-          log(`❌ SMS CANNOT be sent because we are still on the phone entry screen`);
-          log(`❌ DO NOT proceed to wait for SMS - the request was never sent!`);
-          await this.saveScreenshot(driver, '07-failed-to-submit', sessionId || 'unknown');
-          throw new Error('Failed to submit phone number - Next button click did not change the page. Cannot proceed to SMS waiting.');
+        if (confirmationDismissed) {
+          log(`✅ Phone number confirmation dialog handled, waiting for SMS...`);
+          await this.sleep(3000);
+          await this.saveScreenshot(driver, '06-after-confirmation', sessionId || 'unknown');
+          return; // SMS request should be sent now
         }
+
+        // ============================================
+        // STRATÉGIE: ENTER d'abord (impossible à bloquer), puis autres méthodes
+        // ============================================
+        log(`🔍 [STEP 5] Trying to submit phone number...`);
+        
+        let buttonFound = false;
+        
+        // METHODE 0a: Essayer la touche ENTER pour valider le formulaire
+        // WhatsApp ne peut PAS bloquer les touches clavier standard!
+        log(`⌨️ [METHOD 0a] Trying ENTER key to submit form...`);
+        try {
+          // KEYCODE_ENTER = 66
+          await driver.pressKeyCode(66);
+          log(`✅ ENTER key (66) pressed!`);
+          await this.sleep(2000);
+          
+          // Check if it worked
+          const activityAfterEnter = await driver.getCurrentActivity().catch(() => 'unknown');
+          log(`📱 Activity after ENTER: ${activityAfterEnter}`);
+          
+          // Check for confirmation dialog
+          const confirmAfterEnter = await this.handlePhoneConfirmationDialog(driver, log, sessionId || 'unknown');
+          if (confirmAfterEnter) {
+            log(`✅ ENTER worked! Confirmation dialog appeared and handled!`);
+            return;
+          }
+          
+          if (!activityAfterEnter.includes('RegisterPhone') && !activityAfterEnter.includes('EULA')) {
+            log(`✅ ENTER worked! Page changed to: ${activityAfterEnter}`);
+            return;
+          }
+        } catch (e: any) {
+          log(`⚠️ ENTER key failed: ${e.message}`);
+        }
+        
+        // METHODE 0b: Essayer TAB puis ENTER (pour sélectionner le bouton puis l'activer)
+        log(`⌨️ [METHOD 0b] Trying TAB + ENTER...`);
+        try {
+          await driver.pressKeyCode(61); // KEYCODE_TAB
+          log(`✅ TAB key pressed`);
+          await this.sleep(500);
+          await driver.pressKeyCode(66); // KEYCODE_ENTER
+          log(`✅ ENTER key pressed after TAB`);
+          await this.sleep(2000);
+          
+          const activityAfterTabEnter = await driver.getCurrentActivity().catch(() => 'unknown');
+          const confirmAfterTab = await this.handlePhoneConfirmationDialog(driver, log, sessionId || 'unknown');
+          if (confirmAfterTab || (!activityAfterTabEnter.includes('RegisterPhone') && !activityAfterTabEnter.includes('EULA'))) {
+            log(`✅ TAB+ENTER worked!`);
+            return;
+          }
+        } catch (e: any) {
+          log(`⚠️ TAB+ENTER failed: ${e.message}`);
+        }
+        
+        // METHODE 0c: Essayer l'action IME "Done" ou "Go"
+        log(`⌨️ [METHOD 0c] Trying IME action (performEditorAction)...`);
+        try {
+          // IME_ACTION_DONE = 6, IME_ACTION_GO = 2, IME_ACTION_NEXT = 5
+          // Via ADB: input keyevent 66 ou via shell am broadcast
+          if (containerId) {
+            const container = (await import('dockerode')).default ? 
+              new (await import('dockerode')).default().getContainer(containerId) : null;
+            
+            if (container) {
+              // Try sending IME action via ADB
+              const imeCmd = `adb -e shell input keyevent 66`;
+              log(`📱 Sending IME action via ADB: ${imeCmd}`);
+              
+              const exec = await container.exec({
+                Cmd: ['sh', '-c', imeCmd],
+                AttachStdout: true,
+                AttachStderr: true,
+              });
+              const stream = await exec.start({ Detach: false, Tty: false });
+              let output = '';
+              await new Promise<void>((resolve) => {
+                stream.on('data', (chunk: Buffer) => { output += chunk.toString(); });
+                stream.on('end', () => resolve());
+                setTimeout(() => resolve(), 3000);
+              });
+              log(`📋 ADB IME result: ${output.trim() || 'sent'}`);
+              await this.sleep(2000);
+              
+              const activityAfterIme = await driver.getCurrentActivity().catch(() => 'unknown');
+              const confirmAfterIme = await this.handlePhoneConfirmationDialog(driver, log, sessionId || 'unknown');
+              if (confirmAfterIme || (!activityAfterIme.includes('RegisterPhone') && !activityAfterIme.includes('EULA'))) {
+                log(`✅ IME action worked!`);
+                return;
+              }
+            }
+          }
+        } catch (e: any) {
+          log(`⚠️ IME action failed: ${e.message}`);
+        }
+        
+        log(`⚠️ Keyboard methods didn't work, trying click methods...`);
+        
+        // Fermer le clavier pour révéler le bouton NEXT
+        log(`⌨️ Closing keyboard to reveal NEXT button...`);
+        try {
+          await driver.pressKeyCode(4); // KEYCODE_BACK - ferme le clavier
+          log(`✅ Back key pressed (keyboard should close)`);
+          await this.sleep(2000); // Wait 2s for keyboard animation to complete
+          
+          // Scroll down to ensure NEXT button is fully visible
+          log(`📜 Scrolling down to reveal NEXT button...`);
+          try {
+            const { width, height } = await driver.getWindowRect();
+            // Scroll from middle to top to reveal bottom content
+            await driver.touchAction([
+              { action: 'press', x: Math.round(width / 2), y: Math.round(height * 0.7) },
+              { action: 'wait', ms: 200 },
+              { action: 'moveTo', x: Math.round(width / 2), y: Math.round(height * 0.3) },
+              { action: 'release' }
+            ]);
+            log(`✅ Scroll completed`);
+            await this.sleep(1000); // Wait for scroll to settle
+          } catch (scrollErr: any) {
+            log(`⚠️ Scroll failed (might not be needed): ${scrollErr.message}`);
+          }
+        } catch (e: any) {
+          log(`⚠️ Could not press back key: ${e.message}`);
+        }
+        
+        // ETAPE 1: Trouver le bouton NEXT et obtenir ses coordonnées exactes
+        log(`🔍 Finding NEXT button and getting its exact coordinates...`);
+        
+        const buttonSelectors = [
+          '//android.widget.Button[@text="NEXT"]',
+          '//android.widget.Button[@text="Next"]',
+          '//android.widget.Button[contains(@text, "NEXT")]',
+          '//*[@content-desc="Next"]',
+        ];
+        
+        let buttonX = 540;  // Default center
+        let buttonY = 1656; // Default bottom
+        
+        // First, check if we have learned coordinates from manual clicks
+        try {
+          const learnedCoords = await getLearnedClick('NEXT');
+          if (learnedCoords) {
+            buttonX = learnedCoords.x;
+            buttonY = learnedCoords.y;
+            log(`📚 Using learned coordinates from manual clicks: (${buttonX}, ${buttonY})`);
+          } else {
+            log(`ℹ️ No learned coordinates found, will detect from Appium`);
+          }
+        } catch (error: any) {
+          log(`⚠️ Could not get learned coordinates: ${error.message}, will detect from Appium`);
+        }
+        
+        // If no learned coordinates, try to detect from Appium
+        if (buttonX === 540 && buttonY === 1656) {
+          for (const buttonSelector of buttonSelectors) {
+            try {
+              const button = await driver.$(buttonSelector);
+              const exists = await button.isExisting();
+              
+              if (exists) {
+                // Get button's exact location and size
+                try {
+                  const location = await button.getLocation();
+                  const size = await button.getSize();
+                  buttonX = Math.round(location.x + size.width / 2);
+                  buttonY = Math.round(location.y + size.height / 2);
+                  log(`📍 NEXT button found at: (${buttonX}, ${buttonY}) - size: ${size.width}x${size.height}`);
+                } catch (locError: any) {
+                  log(`⚠️ Could not get button location: ${locError.message}, using defaults`);
+                }
+                break;
+              }
+            } catch (e: any) {
+              continue;
+            }
+          }
+        }
+        
+        log(`🎯 Target coordinates for click: (${buttonX}, ${buttonY})`);
+        
+        // =========================================================================
+        // METHODE VNC: Click via VNC first (uses learned coords 540,1656 or detected)
+        // =========================================================================
+        if (!buttonFound && vncPort) {
+          log(`🖱️ [VNC] Clicking NEXT via VNC at (${buttonX}, ${buttonY})...`);
+          try {
+            const vncResult = await clickViaVnc(vncPort, buttonX, buttonY, log);
+            if (vncResult?.success) {
+              log(`✅ VNC click sent!`);
+              await this.sleep(2000);
+              for (let retry = 0; retry < 3; retry++) {
+                const confirmationDismissed = await this.handlePhoneConfirmationDialog(driver, log, sessionId || 'unknown');
+                if (confirmationDismissed) {
+                  log(`✅ Phone confirmation dialog handled after VNC click!`);
+                  buttonFound = true;
+                  break;
+                }
+                await this.sleep(1000);
+              }
+              if (!buttonFound) {
+                const activityAfterVnc = await driver.getCurrentActivity().catch(() => 'unknown');
+                if (activityAfterVnc === 'unknown' && containerId) {
+                  const activityAdb = await this.getCurrentActivityViaAdb(containerId, log);
+                  if (!activityAdb.includes('RegisterPhone') && !activityAdb.includes('EULA')) {
+                    log(`✅ VNC click worked! Page changed to: ${activityAdb}`);
+                    buttonFound = true;
+                  }
+                } else if (!activityAfterVnc.includes('RegisterPhone') && !activityAfterVnc.includes('EULA')) {
+                  log(`✅ VNC click worked! Page changed to: ${activityAfterVnc}`);
+                  buttonFound = true;
+                }
+              }
+            }
+          } catch (e: any) {
+            log(`⚠️ VNC click failed: ${e.message}, trying ADB...`);
+          }
+        }
+        
+        // =========================================================================
+        // METHODE 0: Multiple ADB tap methods with delays (PRIORITE TRES HAUTE)
+        // Essayer plusieurs méthodes ADB avec des délais réalistes
+        // =========================================================================
+        if (!buttonFound && containerId) {
+          log(`📱 [METHODE 0] Multiple ADB tap attempts at (${buttonX}, ${buttonY})...`);
+          try {
+            const Docker = (await import('dockerode')).default;
+            const docker = new Docker();
+            const container = docker.getContainer(containerId);
+            
+            // Method 0a: input tap with delay
+            log(`   📱 Attempt 0a: input tap...`);
+            const exec0a = await container.exec({
+              Cmd: ['sh', '-c', `adb -e shell input tap ${buttonX} ${buttonY}`],
+              AttachStdout: true,
+              AttachStderr: true,
+            });
+            await exec0a.start({ Detach: false, Tty: false });
+            await this.sleep(500);
+            
+            // Method 0b: input touchscreen tap
+            log(`   📱 Attempt 0b: touchscreen tap...`);
+            const exec0b = await container.exec({
+              Cmd: ['sh', '-c', `adb -e shell input touchscreen tap ${buttonX} ${buttonY}`],
+              AttachStdout: true,
+              AttachStderr: true,
+            });
+            await exec0b.start({ Detach: false, Tty: false });
+            await this.sleep(500);
+            
+            // Method 0c: swipe (tap via swipe)
+            log(`   📱 Attempt 0c: swipe tap...`);
+            const exec0c = await container.exec({
+              Cmd: ['sh', '-c', `adb -e shell input swipe ${buttonX} ${buttonY} ${buttonX} ${buttonY} 100`],
+              AttachStdout: true,
+              AttachStderr: true,
+            });
+            await exec0c.start({ Detach: false, Tty: false });
+            await this.sleep(500);
+            
+            log(`✅ Multiple ADB taps sent!`);
+            await this.sleep(2000);
+            
+            // Check for confirmation dialog
+            for (let retry = 0; retry < 3; retry++) {
+              const confirmationDismissed = await this.handlePhoneConfirmationDialog(driver, log, sessionId || 'unknown');
+              if (confirmationDismissed) {
+                log(`✅ Phone confirmation dialog handled after ADB taps!`);
+                buttonFound = true;
+                break;
+              }
+              await this.sleep(1000);
+            }
+            
+            // Check if page changed
+            if (!buttonFound) {
+              let activityAfterAdb = await driver.getCurrentActivity().catch(() => 'unknown');
+              log(`📱 Activity after ADB taps (Appium): ${activityAfterAdb}`);
+              
+              if (activityAfterAdb === 'unknown' && containerId) {
+                log(`📱 Appium session terminated, checking activity via ADB...`);
+                activityAfterAdb = await this.getCurrentActivityViaAdb(containerId, log);
+              }
+              
+              if (!activityAfterAdb.includes('RegisterPhone') && !activityAfterAdb.includes('EULA') && activityAfterAdb !== 'unknown') {
+                log(`✅ ADB taps worked! Page changed to: ${activityAfterAdb}`);
+                buttonFound = true;
+              }
+            }
+          } catch (e: any) {
+            log(`⚠️ ADB taps failed: ${e.message}`);
+          }
+        }
+        
+        // =========================================================================
+        // METHODE 1: xdotool INSTALL + CLICK (PRIORITE HAUTE)
+        // xdotool n'est pas installé par défaut dans le container émulateur.
+        // On l'installe d'abord, puis on clique via XTEST extension de X11.
+        // =========================================================================
+        if (!buttonFound && containerId) {
+          log(`🖱️ [METHODE 1] xdotool install + click at (${buttonX}, ${buttonY})...`);
+          log(`📦 This will install xdotool in emulator container if needed`);
+          
+          const xdotoolResult = await clickViaXdotoolWithWindowDetection(containerId, buttonX, buttonY, log);
+          
+          if (xdotoolResult.success) {
+            log(`✅ xdotool click sent!`);
+            await this.sleep(3000);
+            
+            // Check for confirmation dialog
+            for (let retry = 0; retry < 3; retry++) {
+              const confirmationDismissed2 = await this.handlePhoneConfirmationDialog(driver, log, sessionId || 'unknown');
+              if (confirmationDismissed2) {
+                log(`✅ Phone confirmation dialog handled after xdotool!`);
+                buttonFound = true;
+                break;
+              }
+              await this.sleep(1000);
+            }
+            
+            // Check if page changed
+            if (!buttonFound) {
+              let activityAfterXdo = await driver.getCurrentActivity().catch(() => 'unknown');
+              log(`📱 Activity after xdotool click (Appium): ${activityAfterXdo}`);
+              
+              // If Appium session is terminated, check via ADB
+              if (activityAfterXdo === 'unknown' && containerId) {
+                log(`📱 Appium session terminated, checking activity via ADB...`);
+                activityAfterXdo = await this.getCurrentActivityViaAdb(containerId, log);
+              }
+              
+              if (!activityAfterXdo.includes('RegisterPhone') && !activityAfterXdo.includes('EULA') && activityAfterXdo !== 'unknown') {
+                log(`✅ xdotool click worked! Page changed to: ${activityAfterXdo}`);
+                buttonFound = true;
+              } else if (activityAfterXdo === 'unknown') {
+                log(`⚠️ Could not determine activity - assuming click may have worked, continuing...`);
+                // Don't set buttonFound = true for unknown, but don't fail either
+              }
+            }
+          } else {
+            log(`⚠️ xdotool failed: ${xdotoolResult.error}`);
+          }
+        }
+        
+        // =========================================================================
+        // METHODE 2: Native VNC/RFB (connexion directe via Docker network)
+        // =========================================================================
+        if (!buttonFound && containerId) {
+          log(`🔌 [METHODE 2] Native VNC via Docker network at (${buttonX}, ${buttonY})...`);
+          
+          const nativeVncResult = await clickViaNativeVnc(containerId, buttonX, buttonY, log);
+          
+          if (nativeVncResult.success) {
+            log(`✅ Native VNC click sent via RFB protocol!`);
+            await this.sleep(3000);
+            
+            // Check for confirmation dialog
+            for (let retry = 0; retry < 3; retry++) {
+              const confirmationDismissed2 = await this.handlePhoneConfirmationDialog(driver, log, sessionId || 'unknown');
+              if (confirmationDismissed2) {
+                log(`✅ Phone confirmation dialog handled after Native VNC!`);
+                buttonFound = true;
+                break;
+              }
+              await this.sleep(1000);
+            }
+            
+            // Check if page changed
+            if (!buttonFound) {
+              let activityAfterNativeVnc = await driver.getCurrentActivity().catch(() => 'unknown');
+              log(`📱 Activity after Native VNC click (Appium): ${activityAfterNativeVnc}`);
+              
+              if (activityAfterNativeVnc === 'unknown' && containerId) {
+                log(`📱 Appium session terminated, checking activity via ADB...`);
+                activityAfterNativeVnc = await this.getCurrentActivityViaAdb(containerId, log);
+              }
+              
+              if (!activityAfterNativeVnc.includes('RegisterPhone') && !activityAfterNativeVnc.includes('EULA') && activityAfterNativeVnc !== 'unknown') {
+                log(`✅ Native VNC click worked! Page changed to: ${activityAfterNativeVnc}`);
+                buttonFound = true;
+              }
+            }
+          } else {
+            log(`⚠️ Native VNC failed: ${nativeVncResult.error}`);
+          }
+        }
+        
+        // =========================================================================
+        // METHODE 2: noVNC via Puppeteer (si Native VNC a échoué)
+        // =========================================================================
+        if (!buttonFound && vncPort) {
+          log(`🔄 [METHODE 2] noVNC via Puppeteer at (${buttonX}, ${buttonY})...`);
+          log(`🖱️ VNC port: ${vncPort}`);
+          
+          const vncResult = await clickViaVnc(vncPort, buttonX, buttonY, log);
+          
+          if (vncResult.success) {
+            log(`✅ noVNC click sent!`);
+            await this.sleep(3000);
+            
+            // Check for confirmation dialog
+            for (let retry = 0; retry < 3; retry++) {
+              const confirmationDismissed2 = await this.handlePhoneConfirmationDialog(driver, log, sessionId || 'unknown');
+              if (confirmationDismissed2) {
+                log(`✅ Phone confirmation dialog handled after noVNC!`);
+                buttonFound = true;
+                break;
+              }
+              await this.sleep(1000);
+            }
+            
+            // Check if page changed
+            if (!buttonFound) {
+              let activityAfterVnc = await driver.getCurrentActivity().catch(() => 'unknown');
+              log(`📱 Activity after noVNC click (Appium): ${activityAfterVnc}`);
+              
+              if (activityAfterVnc === 'unknown' && containerId) {
+                log(`📱 Appium session terminated, checking activity via ADB...`);
+                activityAfterVnc = await this.getCurrentActivityViaAdb(containerId, log);
+              }
+              
+              if (!activityAfterVnc.includes('RegisterPhone') && !activityAfterVnc.includes('EULA') && activityAfterVnc !== 'unknown') {
+                log(`✅ noVNC click worked! Page changed to: ${activityAfterVnc}`);
+                buttonFound = true;
+              }
+            }
+          } else {
+            log(`❌ noVNC click failed: ${vncResult.error}`);
+          }
+        }
+        
+        // =========================================================================
+        // METHODE 3: xdotool + ADB tap (commandes internes au container)
+        // =========================================================================
+        if (!buttonFound && containerId) {
+          log(`🔄 [METHODE 3] ADB/xdotool tap at (${buttonX}, ${buttonY})...`);
+          
+          const adbResult = await clickViaAdb(containerId, buttonX, buttonY, log);
+          
+          if (adbResult.success) {
+            log(`✅ ADB/xdotool tap sent!`);
+            await this.sleep(3000);
+            
+            // Check for confirmation dialog
+            for (let retry = 0; retry < 3; retry++) {
+              const confirmationDismissed2 = await this.handlePhoneConfirmationDialog(driver, log, sessionId || 'unknown');
+              if (confirmationDismissed2) {
+                log(`✅ Phone confirmation dialog handled after ADB!`);
+                buttonFound = true;
+                break;
+              }
+              await this.sleep(1000);
+            }
+            
+            // Check if page changed
+            if (!buttonFound) {
+              let activityAfterAdb = await driver.getCurrentActivity().catch(() => 'unknown');
+              log(`📱 Activity after ADB click (Appium): ${activityAfterAdb}`);
+              
+              if (activityAfterAdb === 'unknown' && containerId) {
+                log(`📱 Appium session terminated, checking activity via ADB...`);
+                activityAfterAdb = await this.getCurrentActivityViaAdb(containerId, log);
+              }
+              
+              if (!activityAfterAdb.includes('RegisterPhone') && !activityAfterAdb.includes('EULA') && activityAfterAdb !== 'unknown') {
+                log(`✅ ADB click worked! Page changed to: ${activityAfterAdb}`);
+                buttonFound = true;
+              }
+            }
+          } else {
+            log(`❌ ADB tap failed: ${adbResult.error}`);
+          }
+        }
+        
+        // =========================================================================
+        // METHODE 4: Appium click (dernière option - souvent bloquée par anti-bot)
+        // =========================================================================
+        if (!buttonFound) {
+          log(`🔄 [METHODE 4] Appium click (last resort)...`);
+          
+          for (const buttonSelector of buttonSelectors) {
+            try {
+              const button = await driver.$(buttonSelector);
+              const exists = await button.isExisting();
+              
+              if (exists) {
+                log(`🖱️ Trying Appium click on NEXT button...`);
+                await button.click();
+                log(`✅ Appium click sent!`);
+                await this.sleep(3000);
+                
+                // Check for confirmation dialog
+                for (let retry = 0; retry < 3; retry++) {
+                  const confirmationDismissed2 = await this.handlePhoneConfirmationDialog(driver, log, sessionId || 'unknown');
+                  if (confirmationDismissed2) {
+                    log(`✅ Phone confirmation dialog handled!`);
+                    buttonFound = true;
+                    break;
+                  }
+                  await this.sleep(1000);
+                }
+                
+                // Check if page changed
+                if (!buttonFound) {
+                  let activityAfter = await driver.getCurrentActivity().catch(() => 'unknown');
+                  log(`📱 Activity after Appium click (Appium): ${activityAfter}`);
+                  
+                  if (activityAfter === 'unknown' && containerId) {
+                    log(`📱 Appium session terminated, checking activity via ADB...`);
+                    activityAfter = await this.getCurrentActivityViaAdb(containerId, log);
+                  }
+                  
+                  if (!activityAfter.includes('RegisterPhone') && !activityAfter.includes('EULA') && activityAfter !== 'unknown') {
+                    log(`✅ Appium click worked! Page changed to: ${activityAfter}`);
+                    buttonFound = true;
+                  }
+                }
+                
+                if (buttonFound) break;
+              }
+            } catch (e: any) {
+              log(`⚠️ Appium selector ${buttonSelector} failed: ${e.message}`);
+              continue;
+            }
+          }
+        }
+        
+        // Final check - verify activity via ADB if Appium session is terminated
+        if (!buttonFound && containerId) {
+          log(`📱 Final verification: checking activity via ADB...`);
+          const finalActivity = await this.getCurrentActivityViaAdb(containerId, log);
+          
+          if (!finalActivity.includes('RegisterPhone') && !finalActivity.includes('EULA') && finalActivity !== 'unknown') {
+            log(`✅ Final ADB check: Page changed to ${finalActivity} - click succeeded!`);
+            buttonFound = true;
+          }
+        }
+        
+        // Final check - if still no button found
+        if (!buttonFound) {
+          log(`❌ Could not click "Next" button with any method (VNC+OCR, ADB, Appium).`);
+          await this.saveScreenshot(driver, '08-all-methods-failed', sessionId || 'unknown').catch(() => {});
+          await this.logPageSource(driver, '08-all-methods-failed', sessionId || 'unknown').catch(() => {});
+          throw new Error('Failed to submit phone number - Next button click did not work with any method');
+        }
+        
+        log(`✅ Phone number submission completed successfully!`);
+        await this.saveScreenshot(driver, '07-sms-waiting-screen', sessionId || 'unknown').catch(() => {});
+        
       } else {
         log(`❌ Could not find phone number input field after trying all selectors`);
         await this.saveScreenshot(driver, 'error-no-input-field', sessionId || 'unknown');
@@ -2614,7 +1835,7 @@ ${message}
           });
           log(`⚠️ Play Store opened. Manual installation required. Waiting 60s for manual installation...`);
           await this.sleep(60000); // Wait 60s for manual installation
-          await this.saveScreenshot(driver, 'play-store-wait', sessionId, log); // Use sessionId to avoid TS error
+          await this.saveScreenshot(driver, 'play-store-wait', sessionId); // Use sessionId to avoid TS error
           
           // Check again
           const isNowInstalled = await this.isAppInstalled(driver, 'com.whatsapp');
@@ -2629,8 +1850,7 @@ ${message}
       
       // Method 2: Download and install APK directly via Appium shell (requires relaxed-security)
       log(`📥 Downloading WhatsApp APK via Appium shell...`);
-      // Use version from early December 2024 (working 3-5 days ago)
-      const apkUrl = 'https://www.whatsapp.com/android/2.24.24.76/WhatsApp.apk';
+      const apkUrl = 'https://www.whatsapp.com/android/current/WhatsApp.apk';
       
       try {
         // Download APK to container's /tmp directory
@@ -2647,7 +1867,7 @@ ${message}
         });
         
         log(`✅ WhatsApp APK installation completed`);
-        await this.sleep(2000); // Wait for installation to complete
+        await this.sleep(5000); // Wait for installation to complete
         
         // Verify installation
         const isInstalled = await this.isAppInstalled(driver, 'com.whatsapp');
@@ -2768,7 +1988,7 @@ ${message}
       driver = await remote(RemoteOptions);
       log(`✅ Connected to Appium server successfully`);
 
-      await this.sleep(1000);
+      await this.sleep(3000);
       
       // Detect current screen before starting OTP injection
       await this.detectCurrentScreen(driver, log);
@@ -2960,13 +2180,13 @@ ${message}
       }
 
       if (!otpInput || !(await otpInput.isExisting().catch(() => false))) {
-        await this.saveScreenshot(driver, 'otp-screen-no-input', sessionId, log);
+        await this.saveScreenshot(driver, 'otp-screen-no-input', sessionId);
         await this.logPageSource(driver, 'otp-screen-no-input', sessionId);
         throw new Error('Could not find OTP input field after waiting 60 seconds. The "Verifying your number" screen may not have appeared.');
       }
 
       log(`✅ OTP verification screen is visible, input field found!`);
-      await this.saveScreenshot(driver, 'otp-screen-found', sessionId, log);
+      await this.saveScreenshot(driver, 'otp-screen-found', sessionId);
       await this.logPageSource(driver, 'otp-screen-found', sessionId);
 
       // Enter OTP digit by digit (for 6-digit code)
@@ -3019,7 +2239,7 @@ ${message}
       log(`✅ OTP code entry completed`);
 
       await this.sleep(2000);
-      await this.saveScreenshot(driver, 'otp-entered', sessionId, log);
+      await this.saveScreenshot(driver, 'otp-entered', sessionId);
 
       // Look for "Next" or "Verify" button
       log(`🔍 Looking for verification button...`);
@@ -3051,17 +2271,83 @@ ${message}
         }
       }
 
-      await this.saveScreenshot(driver, 'otp-after-verify', sessionId, log);
+      await this.saveScreenshot(driver, 'otp-after-verify', sessionId);
       log(`✅ Verification button clicked`);
 
-      // Wait briefly for transition to next screen (permissions or profile)
-      await this.sleep(2000);
+      // Wait for OTP verification to complete - look for "Verified" status
+      log(`⏳ Waiting for OTP verification to complete (looking for "Verified" status)...`);
+      const maxVerifyWaitTime = 30000; // 30 seconds max wait
+      const verifyCheckInterval = 2000; // Check every 2 seconds
+      const verifyStartTime = Date.now();
+      let verificationComplete = false;
+
+      while (Date.now() - verifyStartTime < maxVerifyWaitTime && !verificationComplete) {
+        await this.sleep(verifyCheckInterval);
+        await this.saveScreenshot(driver, `otp-verify-wait-${Date.now()}`, sessionId);
+
+        // Look for "Verified" text or status indicator
+        const verifiedIndicators = [
+          '//*[contains(@text, "Verified")]',
+          '//*[contains(@text, "VERIFIED")]',
+          '//*[contains(@content-desc, "Verified")]',
+          '//*[@resource-id="com.whatsapp:id/verification_status"]',
+        ];
+
+        for (const selector of verifiedIndicators) {
+          try {
+            const verifiedElement = await driver.$(selector);
+            const exists = await verifiedElement.isExisting().catch(() => false);
+            if (exists) {
+              const isDisplayed = await verifiedElement.isDisplayed().catch(() => false);
+              if (isDisplayed) {
+                const text = await verifiedElement.getText().catch(() => '');
+                if (text.toLowerCase().includes('verified')) {
+                  log(`✅ OTP verification complete! Found "Verified" status`);
+                  verificationComplete = true;
+                  await this.saveScreenshot(driver, 'otp-verified', sessionId);
+                  break;
+                }
+              }
+            }
+          } catch (e) {
+            continue;
+          }
+        }
+
+        // Also check if we've moved to the next screen (profile setup)
+        if (!verificationComplete) {
+          try {
+            const currentActivity = await driver.getCurrentActivity();
+            if (currentActivity && (
+              currentActivity.includes('profile') || 
+              currentActivity.includes('name') ||
+              currentActivity.includes('setup')
+            )) {
+              log(`✅ Moved to profile setup screen, verification likely complete`);
+              verificationComplete = true;
+              break;
+            }
+          } catch (e) {
+            // Ignore activity check errors
+          }
+        }
+      }
+
+      if (!verificationComplete) {
+        log(`⚠️ Could not confirm "Verified" status, but proceeding with next steps...`);
+      } else {
+        log(`✅ OTP code verified successfully`);
+      }
+
+      // Wait a bit more for WhatsApp to process OTP and show next screen (profile setup or main chat)
+      log(`⏳ Waiting for WhatsApp to transition to next screen...`);
+      await this.sleep(3000);
 
       // Check what screen we're on now
       try {
         const currentActivity = await driver.getCurrentActivity();
         log(`📱 Current activity after OTP: ${currentActivity}`);
-        await this.saveScreenshot(driver, 'after-otp-verification', sessionId, log);
+        await this.saveScreenshot(driver, 'after-otp-verification', sessionId);
       } catch (e) {
         // Ignore
       }
@@ -3071,22 +2357,47 @@ ${message}
       const screenAfterOtp = await this.detectCurrentScreen(driver, log);
       log(`🖥️ Screen after OTP: ${screenAfterOtp}`);
 
-      // CRITICAL: Check if phone is already registered on another device
-      log(`🔍 Checking if phone is already registered on another device...`);
-      await this.checkForPhoneAlreadyRegistered(driver, log, sessionId);
-
       // Complete profile setup if needed (name, photo)
       // Note: Contact permission popup is handled inside completeProfileSetup now
       log(`🔧 Completing profile setup (including permissions and profile info)...`);
       await this.completeProfileSetup(driver, log, sessionId);
 
-      // Quick verification that we're on HomeActivity
-      log(`🔍 Verifying WhatsApp activation...`);
-      await this.sleep(1000); // Just 1 second to ensure UI is stable
+      // Handle "Test message" screen - WhatsApp may ask to send a test message
+      log(`🔍 Checking for test message screen...`);
+      await this.handleTestMessageScreen(driver, log, sessionId);
       
+      // Check for Profile info again (can appear after test message)
+      log(`🔍 Checking for Profile info again (after test message)...`);
+      await this.handleProfileInfoScreen(driver, log, sessionId);
+
+      // Handle "Restore a backup" screen - WhatsApp may ask to restore from Google
+      log(`🔍 Checking for restore backup screen...`);
+      await this.handleRestoreBackupScreen(driver, log, sessionId);
+      
+      // Check for Profile info again (can appear after restore backup)
+      log(`🔍 Checking for Profile info again (after restore backup)...`);
+      await this.handleProfileInfoScreen(driver, log, sessionId);
+
+      log(`🔍 Checking for email screen...`);
+      await this.handleEmailScreen(driver, log, sessionId);
+
+      // NOTE: We now skip the email screen directly, so no Help popup or email verification screens appear
+      // If email was skipped, we're done. If email was filled, check for potential issues:
+      log(`🔍 Checking for "Help" popup after email (if email was filled)...`);
+      await this.handleHelpPopupAndResubmit(driver, log, sessionId);
+
+      log(`🔍 Checking for email verification screen (if email was filled)...`);
+      await this.handleEmailVerificationScreen(driver, log, sessionId);
+
+      // Wait for WhatsApp to fully initialize (shorter wait since we skip email now)
+      log(`⏳ Waiting for WhatsApp to complete activation (5 seconds)...`);
+      await this.sleep(5000); // Reduced from 10s to 5s since we skip email directly
+
+      // Try to verify WhatsApp activation with retries
+      log(`🔍 Verifying WhatsApp activation...`);
       let isActivated = false;
       let retryCount = 0;
-      const maxRetries = 2; // Reduced from 3 to 2
+      const maxRetries = 3;
       
       while (!isActivated && retryCount < maxRetries) {
         retryCount++;
@@ -3101,11 +2412,11 @@ ${message}
       
       if (isActivated) {
         log(`✅ WhatsApp account activated successfully!`);
-        await this.saveScreenshot(driver, 'whatsapp-activated', sessionId, log);
+        await this.saveScreenshot(driver, 'whatsapp-activated', sessionId);
       } else {
         log(`⚠️ Could not verify WhatsApp activation after ${maxRetries} attempts`);
         log(`ℹ️ WhatsApp may still be loading or on an unexpected screen`);
-        await this.saveScreenshot(driver, 'whatsapp-not-activated', sessionId, log);
+        await this.saveScreenshot(driver, 'whatsapp-not-activated', sessionId);
         
         // Take page source for debugging
         try {
@@ -3122,7 +2433,7 @@ ${message}
       log(`❌ OTP injection failed: ${error.message}`);
       logger.error({ error: error.message, sessionId }, 'OTP injection failed');
       if (driver) {
-        await this.saveScreenshot(driver, 'otp-injection-error', sessionId, log);
+        await this.saveScreenshot(driver, 'otp-injection-error', sessionId);
       }
       throw error;
     } finally {
@@ -3136,7 +2447,7 @@ ${message}
   }
 
   /**
-   * Handle "Restore a backup" screen - click "Skip" to skip all restore/transfer popups
+   * Handle "Restore a backup" screen - click "Cancel" to skip
    */
   private async handleRestoreBackupScreen(driver: any, log: (msg: string) => void, sessionId: string): Promise<void> {
     try {
@@ -3144,15 +2455,10 @@ ${message}
       
       // Look for text that indicates we're on the restore backup screen
       const restoreBackupIndicators = [
-        '//*[contains(@text, "Restore or transfer chats")]',
-        '//*[contains(@text, "Transfer from old phone")]',
-        '//*[contains(@text, "Restore from backup")]',
         '//*[contains(@text, "Restore a backup")]',
         '//*[contains(@text, "Restore backup")]',
         '//*[contains(@text, "restore your backup")]',
         '//*[contains(@text, "Google storage")]',
-        '//*[contains(@text, "backed up to Google")]',
-        '//*[contains(@text, "Google account for backups")]',
       ];
 
       let onRestoreScreen = false;
@@ -3162,8 +2468,8 @@ ${message}
           const exists = await element.isExisting().catch(() => false);
           if (exists) {
             onRestoreScreen = true;
-            log(`✅ Found restore/transfer backup screen`);
-            await this.saveScreenshot(driver, 'restore-backup-screen', sessionId, log);
+            log(`✅ Found restore backup screen`);
+            await this.saveScreenshot(driver, 'restore-backup-screen', sessionId);
             break;
           }
         } catch (e) {
@@ -3172,31 +2478,31 @@ ${message}
       }
 
       if (onRestoreScreen) {
-        // Look for "Skip" button (always Skip, never Continue or Give permission)
-        log(`🔍 Looking for Skip button on restore/transfer screen...`);
-        const skipButtonSelectors = [
-          '//android.widget.Button[@text="Skip"]',
-          '//android.widget.Button[@text="SKIP"]',
-          '//*[@text="Skip"]',
-          '//*[@text="SKIP"]',
-          '//android.widget.TextView[@text="Skip"]',
-          '(//*[contains(@text, "Skip")])[1]', // First Skip button if multiple
+        // Look for "Cancel" button
+        log(`🔍 Looking for Cancel button on restore backup screen...`);
+        const cancelButtonSelectors = [
+          '//android.widget.Button[@text="Cancel"]',
+          '//android.widget.Button[@text="CANCEL"]',
+          '//*[@text="Cancel"]',
+          '//*[@text="CANCEL"]',
+          '//android.widget.Button[contains(@text, "Cancel")]',
+          '//android.widget.Button[contains(@text, "cancel")]',
         ];
 
         let buttonClicked = false;
-        for (const selector of skipButtonSelectors) {
+        for (const selector of cancelButtonSelectors) {
           try {
             const button = await driver.$(selector);
             const exists = await button.isExisting().catch(() => false);
             if (exists) {
               const isDisplayed = await button.isDisplayed().catch(() => false);
               if (isDisplayed) {
-                log(`✅ Found Skip button, clicking...`);
+                log(`✅ Found Cancel button on restore backup screen, clicking...`);
                 await button.click();
-                await this.sleep(3000);
-                log(`✅ First restore/transfer screen skipped`);
+                await this.sleep(2000);
+                log(`✅ Restore backup screen skipped (Cancel clicked)`);
                 buttonClicked = true;
-                await this.saveScreenshot(driver, 'after-first-skip', sessionId, log);
+                await this.saveScreenshot(driver, 'after-restore-cancel', sessionId);
                 break;
               }
             }
@@ -3206,59 +2512,26 @@ ${message}
         }
 
         if (!buttonClicked) {
-          log(`⚠️ Skip button not found, trying alternative search...`);
-        }
-        
-        // CRITICAL: Check for SECOND popup (appears after first Skip)
-        if (buttonClicked) {
-          log(`🔍 Checking for second Google backup popup...`);
+          log(`⚠️ Cancel button not found by selector, trying all buttons...`);
+          try {
+            const allButtons = await driver.$$('//android.widget.Button');
+            for (const btn of allButtons) {
+              try {
+                const text = await btn.getText().catch(() => '');
+                if (text.toLowerCase().includes('cancel')) {
+                  log(`✅ Found Cancel button by text, clicking...`);
+                  await btn.click();
                   await this.sleep(2000);
-          
-          const secondPopupIndicators = [
-            '//*[contains(@text, "backed up to Google storage")]',
-            '//*[contains(@text, "Google account for backups")]',
-            '//*[contains(@text, "Give permission")]',
-          ];
-          
-          let secondPopupFound = false;
-          for (const selector of secondPopupIndicators) {
-            try {
-              const elem = await driver.$(selector);
-              const exists = await elem.isExisting().catch(() => false);
-              if (exists) {
-                secondPopupFound = true;
-                log(`✅ Second Google backup popup detected!`);
-                await this.saveScreenshot(driver, 'second-backup-popup', sessionId, log);
+                  log(`✅ Restore backup screen skipped (Cancel clicked)`);
+                  await this.saveScreenshot(driver, 'after-restore-cancel', sessionId);
                   break;
                 }
               } catch (e) {
                 continue;
-            }
-          }
-          
-          if (secondPopupFound) {
-            log(`🔍 Looking for Skip button on second popup...`);
-            for (const selector of skipButtonSelectors) {
-              try {
-                const skipBtn = await driver.$(selector);
-                const exists = await skipBtn.isExisting().catch(() => false);
-                if (exists) {
-                  const isDisplayed = await skipBtn.isDisplayed().catch(() => false);
-                  if (isDisplayed) {
-                    log(`✅ Found Skip button on second popup, clicking...`);
-                    await skipBtn.click();
-                    await this.sleep(3000);
-                    log(`✅ Second backup popup skipped`);
-                    await this.saveScreenshot(driver, 'after-second-skip', sessionId, log);
-                    break;
               }
             }
           } catch (e) {
-                continue;
-              }
-            }
-          } else {
-            log(`ℹ️ No second backup popup found`);
+            log(`⚠️ Alternative button search failed`);
           }
         }
       } else {
@@ -3279,7 +2552,7 @@ ${message}
       await this.sleep(3000);
       
       // Take screenshot first to see what we're dealing with
-      await this.saveScreenshot(driver, 'check-test-message-screen', sessionId, log);
+      await this.saveScreenshot(driver, 'check-test-message-screen', sessionId);
       
       // Look for text that indicates we're on the test message screen
       const testMessageIndicators = [
@@ -3322,7 +2595,7 @@ ${message}
       }
 
       if (onTestScreen) {
-        await this.saveScreenshot(driver, 'test-message-screen-detected', sessionId, log);
+        await this.saveScreenshot(driver, 'test-message-screen-detected', sessionId);
         
         // Look for "Next" button - try multiple strategies
         log(`🔍 Looking for Next button on test message screen...`);
@@ -3364,7 +2637,7 @@ ${message}
                     await this.sleep(3000);
                     log(`✅ Test message screen passed`);
                     buttonClicked = true;
-                    await this.saveScreenshot(driver, 'after-test-message', sessionId, log);
+                    await this.saveScreenshot(driver, 'after-test-message', sessionId);
                     break;
                   }
                 } catch (btnError) {
@@ -3384,7 +2657,7 @@ ${message}
                   await this.sleep(3000);
                   log(`✅ Test message screen passed`);
                   buttonClicked = true;
-                  await this.saveScreenshot(driver, 'after-test-message', sessionId, log);
+                  await this.saveScreenshot(driver, 'after-test-message', sessionId);
                   break;
                 }
               }
@@ -3396,7 +2669,7 @@ ${message}
 
         if (!buttonClicked) {
           log(`⚠️ Could not find Next button on test message screen, will try to continue anyway`);
-          await this.saveScreenshot(driver, 'test-message-no-next-found', sessionId, log);
+          await this.saveScreenshot(driver, 'test-message-no-next-found', sessionId);
         }
       } else {
         log(`ℹ️ No test message screen found, continuing...`);
@@ -3416,7 +2689,7 @@ ${message}
       log(`🔍 Checking for email screen...`);
       await this.sleep(2000);
       
-      await this.saveScreenshot(driver, 'check-email-screen', sessionId, log);
+      await this.saveScreenshot(driver, 'check-email-screen', sessionId);
       
       // Look for text that indicates we're on the email screen
       const emailScreenIndicators = [
@@ -3455,7 +2728,7 @@ ${message}
           await driver.hideKeyboard();
           await this.sleep(1000);
           log(`✅ Keyboard closed successfully`);
-          await this.saveScreenshot(driver, 'after-keyboard-closed', sessionId, log);
+          await this.saveScreenshot(driver, 'after-keyboard-closed', sessionId);
         } catch (keyboardError) {
           log(`⚠️ Could not close keyboard (might already be closed): ${keyboardError}`);
           // Try alternative: tap outside keyboard area
@@ -3467,7 +2740,7 @@ ${message}
             });
             await this.sleep(1000);
             log(`✅ Tapped outside keyboard`);
-            await this.saveScreenshot(driver, 'after-tap-outside-keyboard', sessionId, log);
+            await this.saveScreenshot(driver, 'after-tap-outside-keyboard', sessionId);
           } catch (tapError) {
             log(`⚠️ Could not tap outside keyboard: ${tapError}`);
           }
@@ -3502,7 +2775,7 @@ ${message}
                 await this.sleep(2000);
                 log(`✅ Email screen skipped successfully!`);
                 skipped = true;
-                await this.saveScreenshot(driver, 'after-email-skip', sessionId, log);
+                await this.saveScreenshot(driver, 'after-email-skip', sessionId);
                 return; // Done! No need to fill email
               }
             }
@@ -3539,7 +2812,7 @@ ${message}
                   await this.sleep(1000);
                   log(`✅ Email entered successfully`);
                   emailFilled = true;
-                  await this.saveScreenshot(driver, 'after-email-entry', sessionId, log);
+                  await this.saveScreenshot(driver, 'after-email-entry', sessionId);
                   
                   // CRITICAL: Hide keyboard to reveal the submit button (blue checkmark)
                   log(`⌨️ Hiding keyboard to reveal submit button...`);
@@ -3547,7 +2820,7 @@ ${message}
                     await driver.hideKeyboard();
                     await this.sleep(1000);
                     log(`✅ Keyboard hidden successfully`);
-                    await this.saveScreenshot(driver, 'after-keyboard-hidden', sessionId, log);
+                    await this.saveScreenshot(driver, 'after-keyboard-hidden', sessionId);
                   } catch (keyboardError) {
                     log(`⚠️ Could not hide keyboard (might already be hidden): ${keyboardError}`);
                     // Try alternative method: tap outside the keyboard area
@@ -3611,7 +2884,7 @@ ${message}
                       await lastButton.click();
                       await this.sleep(2000);
                       log(`✅ Email screen completed (button clicked)`);
-                      await this.saveScreenshot(driver, 'after-email-next', sessionId, log);
+                      await this.saveScreenshot(driver, 'after-email-next', sessionId);
                       buttonClicked = true;
                       break;
                     }
@@ -3626,7 +2899,7 @@ ${message}
                       await button.click();
                       await this.sleep(2000);
                       log(`✅ Email screen completed (Next clicked)`);
-                      await this.saveScreenshot(driver, 'after-email-next', sessionId, log);
+                      await this.saveScreenshot(driver, 'after-email-next', sessionId);
                       buttonClicked = true;
                       break;
                     }
@@ -3644,7 +2917,7 @@ ${message}
                 await driver.execute('mobile: pressKey', { keycode: 66 }); // 66 = ENTER
                 await this.sleep(2000);
                 log(`✅ ENTER key pressed to submit email`);
-                await this.saveScreenshot(driver, 'after-email-enter', sessionId, log);
+                await this.saveScreenshot(driver, 'after-email-enter', sessionId);
               } catch (enterError) {
                 log(`❌ Could not press ENTER: ${enterError}`);
               }
@@ -3672,7 +2945,7 @@ ${message}
     try {
       log(`🔍 Checking for email verification screen...`);
       await this.sleep(2000);
-      await this.saveScreenshot(driver, 'check-email-verification', sessionId, log);
+      await this.saveScreenshot(driver, 'check-email-verification', sessionId);
       
       // Check if "Verify your email" screen is visible
       const verificationIndicators = [
@@ -3692,7 +2965,7 @@ ${message}
             if (isDisplayed) {
               verificationScreenFound = true;
               log(`✅ Found "Verify your email" screen`);
-              await this.saveScreenshot(driver, 'email-verification-detected', sessionId, log);
+              await this.saveScreenshot(driver, 'email-verification-detected', sessionId);
               break;
             }
           }
@@ -3725,7 +2998,7 @@ ${message}
                 await button.click();
                 await this.sleep(2000);
                 log(`✅ Email verification skipped successfully`);
-                await this.saveScreenshot(driver, 'after-email-verification-skip', sessionId, log);
+                await this.saveScreenshot(driver, 'after-email-verification-skip', sessionId);
                 skipClicked = true;
                 break;
               }
@@ -3764,7 +3037,7 @@ ${message}
     try {
       log(`🔍 Checking for "Help" popup...`);
       await this.sleep(2000);
-      await this.saveScreenshot(driver, 'check-help-popup', sessionId, log);
+      await this.saveScreenshot(driver, 'check-help-popup', sessionId);
       
       // Check if "Help" popup is visible
       const helpIndicators = [
@@ -3783,7 +3056,7 @@ ${message}
             if (isDisplayed) {
               helpPopupFound = true;
               log(`✅ Found "Help" popup blocking the screen`);
-              await this.saveScreenshot(driver, 'help-popup-detected', sessionId, log);
+              await this.saveScreenshot(driver, 'help-popup-detected', sessionId);
               break;
             }
           }
@@ -3881,7 +3154,7 @@ ${message}
         
         if (closed) {
           log(`✅ "Help" popup handled and email should be submitted`);
-          await this.saveScreenshot(driver, 'help-popup-handled', sessionId, log);
+          await this.saveScreenshot(driver, 'help-popup-handled', sessionId);
         } else {
           log(`⚠️ Could not handle "Help" popup with standard methods`);
         }
@@ -3895,94 +3168,27 @@ ${message}
   }
 
   /**
-   * Check if phone is already registered on another device
-   * This screen appears when the number is already associated with another WhatsApp account
-   */
-  private async checkForPhoneAlreadyRegistered(driver: any, log: (msg: string) => void, sessionId: string): Promise<void> {
-    try {
-      await this.sleep(1000);
-      await this.saveScreenshot(driver, 'check-phone-already-registered', sessionId, log);
-      
-      const pageSource = await driver.getPageSource().catch(() => '');
-      
-      // Detect "Confirm moving phones" or "already registered" screen
-      const alreadyRegisteredIndicators = [
-        '//*[@text="Confirm moving phones"]',
-        '//*[contains(@text, "Confirm moving phones")]',
-        '//*[contains(@text, "already registered")]',
-        '//*[contains(@text, "is already registered on a different phone")]',
-        '//*[contains(@text, "confirmation notice was sent")]',
-        '//*[contains(@text, "Use your other phone to confirm")]',
-      ];
-      
-      let isAlreadyRegistered = false;
-      for (const selector of alreadyRegisteredIndicators) {
-        try {
-          const elem = await driver.$(selector);
-          const exists = await elem.isExisting().catch(() => false);
-          if (exists) {
-            log(`❌ PHONE ALREADY REGISTERED - Detected: "${selector}"`);
-            isAlreadyRegistered = true;
-            break;
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-      
-      // Also check page source for these phrases
-      if (!isAlreadyRegistered) {
-        if (pageSource.includes('Confirm moving phones') || 
-            pageSource.includes('already registered') ||
-            pageSource.includes('confirmation notice was sent')) {
-          log(`❌ PHONE ALREADY REGISTERED - Detected in page source`);
-          isAlreadyRegistered = true;
-        }
-      }
-      
-      if (isAlreadyRegistered) {
-        await this.saveScreenshot(driver, 'phone-already-registered-ERROR', sessionId, log);
-        log(`❌ ========================================`);
-        log(`❌ ERREUR CRITIQUE : Ce numéro de téléphone est déjà enregistré sur un autre appareil WhatsApp.`);
-        log(`❌ Le processus de provisioning va s'arrêter.`);
-        log(`❌ ========================================`);
-        
-        throw new Error('PHONE_ALREADY_REGISTERED: This phone number is already registered on another WhatsApp device. Cannot proceed with provisioning.');
-      }
-      
-      log(`✅ Phone is not registered on another device, continuing...`);
-      
-    } catch (error: any) {
-      // If it's our specific error, re-throw it
-      if (error.message && error.message.includes('PHONE_ALREADY_REGISTERED')) {
-        throw error;
-      }
-      // Otherwise, log and continue (detection failed but might be fine)
-      log(`⚠️ Error checking for already registered phone: ${error.message}, continuing...`);
-    }
-  }
-
-  /**
-   * Handle contact permission popup - click "Allow" for Android native permission dialog
+   * Handle contact permission popup - click "Not now" or "Deny" to continue
    */
   private async handleContactPermissionPopup(driver: any, log: (msg: string) => void, sessionId: string): Promise<void> {
     try {
-      log(`🔍 Detecting contacts/media permission popup actively...`);
+      log(`🔍 Checking for contacts/media permission popup...`);
+      await this.sleep(2000);
 
-      // Check IMMEDIATELY if we're on Android permission dialog (no waiting loop)
+      // Check if we're on Android permission dialog (GrantPermissionsActivity)
       let currentActivity = '';
       try {
         currentActivity = await driver.execute('mobile: getCurrentActivity');
-        log(`📱 Activité détectée: ${currentActivity}`);
+        log(`📱 Current activity: ${currentActivity}`);
       } catch (e) {
-        log(`⚠️ Impossible de récupérer l'activité`);
+        // Ignore
       }
 
       const isAndroidPermissionDialog = currentActivity && currentActivity.includes('GrantPermissionsActivity');
       
       if (isAndroidPermissionDialog) {
-          log(`✅ Popup de permissions Android détecté ! Gestion immédiate...`);
-          await this.saveScreenshot(driver, 'android-permission-dialog-detected', sessionId, log);
+        log(`✅ Detected Android native permission dialog (GrantPermissionsActivity)`);
+        await this.saveScreenshot(driver, 'android-permission-dialog', sessionId);
         
         // Android can show MULTIPLE permission popups in succession
         // We need to handle them in a loop until we're no longer on GrantPermissionsActivity
@@ -3991,7 +3197,7 @@ ${message}
         
         while (retryCount < maxRetries) {
           retryCount++;
-            log(`🔄 Handling permission dialog ${retryCount}/${maxRetries}...`);
+          log(`🔄 Android permission dialog attempt ${retryCount}/${maxRetries}...`);
           
           // Check if we're still on permission dialog
           let checkActivity = '';
@@ -4003,35 +3209,24 @@ ${message}
           
           if (!checkActivity.includes('GrantPermissionsActivity')) {
             log(`✅ No longer on GrantPermissionsActivity! Successfully dismissed all permission dialogs.`);
-            await this.saveScreenshot(driver, 'all-android-permissions-dismissed', sessionId, log);
+            await this.saveScreenshot(driver, 'all-android-permissions-dismissed', sessionId);
             return; // Success! We're out of the permission loop
           }
           
           log(`📱 Still on: ${checkActivity}`);
           await this.saveScreenshot(driver, `android-permission-attempt-${retryCount}`, sessionId);
           
-            // PRIORITY: Click "Allow" button FIRST (for Profile info screen - user explicitly requested)
-            const androidAllowSelectors = [
-            '//*[@resource-id="com.android.permissioncontroller:id/permission_allow_button"]',
-            '//android.widget.Button[@text="Allow"]',
-            '//android.widget.Button[@text="ALLOW"]',
-            '//*[@text="Allow"]',
-              '//*[@text="ALLOW"]',
-            ];
-            
-            // Fallback to Deny if Allow is not found
-            const androidDenySelectors = [
+          // For Android native dialogs, use resource-id selectors
+          const androidButtonSelectors = [
             '//*[@resource-id="com.android.permissioncontroller:id/permission_deny_button"]',
             '//android.widget.Button[@text="Deny"]',
             '//android.widget.Button[@text="DENY"]',
-              '//*[@text="Deny"]',
-              '//*[@text="DENY"]',
-              '//android.widget.TextView[@text="Deny"]',
-              '//android.widget.TextView[@text="DENY"]',
+            '//*[@resource-id="com.android.permissioncontroller:id/permission_allow_button"]',
+            '//android.widget.Button[@text="Allow"]',
+            '//android.widget.Button[@text="ALLOW"]',
+            '//*[@text="Deny"]',
+            '//*[@text="Allow"]',
           ];
-            
-            // Try Allow first
-            const androidButtonSelectors = [...androidAllowSelectors, ...androidDenySelectors];
           
           let clicked = false;
           for (const selector of androidButtonSelectors) {
@@ -4086,7 +3281,7 @@ ${message}
           
           if (!clicked) {
             log(`⚠️ Could not click Android permission button with selectors, trying emergency fallback...`);
-            // Emergency fallback: find ALL buttons and click Allow first
+            // Emergency fallback: find ALL buttons and click the first one that looks like Deny/Allow
             try {
               const allButtons = await driver.$$('//android.widget.Button');
               log(`📊 Found ${allButtons.length} buttons total on Android dialog`);
@@ -4097,12 +3292,11 @@ ${message}
                   const exists = await btn.isExisting().catch(() => false);
                   const isDisplayed = exists ? await btn.isDisplayed().catch(() => false) : false;
                   
-                  // PRIORITY: Click "Allow" button first (for Profile info screen)
-                  if (isDisplayed && text.toLowerCase().includes('allow')) {
-                    log(`🎯 Emergency: Clicking "Allow" button "${text}" (index ${i})...`);
+                  if (isDisplayed && (text.toLowerCase().includes('deny') || text.toLowerCase().includes('allow'))) {
+                    log(`🎯 Emergency: Clicking button "${text}" (index ${i})...`);
                     await btn.click();
-                    await this.sleep(1000);
-                    log(`✅ Emergency click completed - Permission granted`);
+                    await this.sleep(2000);
+                    log(`✅ Emergency click completed`);
                     clicked = true;
                     break;
                   }
@@ -4111,34 +3305,11 @@ ${message}
                 }
               }
               
-              // If no Allow found, try Deny
-              if (!clicked) {
-                for (let i = 0; i < allButtons.length; i++) {
-                  try {
-                    const btn = allButtons[i];
-                    const text = await btn.getText().catch(() => '');
-                    const exists = await btn.isExisting().catch(() => false);
-                    const isDisplayed = exists ? await btn.isDisplayed().catch(() => false) : false;
-                    
-                    if (isDisplayed && text.toLowerCase().includes('deny')) {
-                      log(`🎯 Fallback: Clicking "Deny" button "${text}" (index ${i})...`);
-                      await btn.click();
-                      await this.sleep(1000);
-                      log(`✅ Fallback click completed - Permission denied`);
-                      clicked = true;
-                      break;
-                    }
-                  } catch (btnError) {
-                    continue;
-                  }
-                }
-              }
-              
               if (!clicked && allButtons.length > 0) {
-                // Last resort: click the first button (usually Allow)
-                log(`🎯 Last resort: Clicking first button...`);
-                await allButtons[0].click();
-                await this.sleep(1000);
+                // Last resort: click the last button
+                log(`🎯 Last resort: Clicking last button...`);
+                await allButtons[allButtons.length - 1].click();
+                await this.sleep(2000);
                 clicked = true;
               }
             } catch (fallbackError) {
@@ -4151,160 +3322,86 @@ ${message}
             break; // Can't proceed
           }
           
-          // Wait briefly before checking again
-          await this.sleep(1000);
+          // Wait a bit before checking again
+          await this.sleep(2000);
         }
         
-        log(`✅ Handled ${retryCount} Android permission dialog(s)`);
+        log(`⚠️ Exited permission dialog loop after ${retryCount} attempts`);
+        await this.saveScreenshot(driver, 'after-android-permission-loop', sessionId);
         return; // Done with Android dialog
       }
 
-      // If no Android permission dialog was detected, check for WhatsApp permission popup
-      log(`ℹ️ Pas de popup Android natif, vérification du popup WhatsApp...`);
-      
-      // Check for WhatsApp-specific "Contacts and media" popup
-      await this.sleep(1000);
-      await this.saveScreenshot(driver, 'check-whatsapp-permission-popup', sessionId, log);
-      
-      const whatsappPermissionSelectors = [
-        '//*[@text="Contacts and media"]',
+      // WhatsApp permission popup (not Android native)
+      const permissionDialogSelectors = [
+        '//*[contains(@text, "Allow WhatsApp to access your contacts")]',
+        '//*[contains(@text, "access your contacts")]',
         '//*[contains(@text, "Contacts and media")]',
-        '//*[contains(@text, "allow WhatsApp to access your contacts")]',
-        '//*[contains(@text, "contacts, photos and other media")]',
+        '//*[contains(@text, "photos and media")]',
+        '//*[contains(@text, "Allow WhatsApp to access")]',
+        '//*[contains(@text, "Allow") and contains(@text, "contacts")]',
+        '//*[contains(@text, "Allow") and contains(@text, "photos")]',
+        '//*[contains(@text, "contact")]',
+        '//*[contains(@text, "media")]',
+        '//*[contains(@text, "photos")]',
       ];
 
-      let isWhatsAppPermissionPopup = false;
-      for (const selector of whatsappPermissionSelectors) {
+      let dialogFound = false;
+      for (const selector of permissionDialogSelectors) {
         try {
-          const elem = await driver.$(selector);
-          const exists = await elem.isExisting().catch(() => false);
+          const dialog = await driver.$(selector);
+          const exists = await dialog.isExisting().catch(() => false);
           if (exists) {
-            log(`✅ WhatsApp "Contacts and media" popup detected!`);
-            isWhatsAppPermissionPopup = true;
+            const isDisplayed = await dialog.isDisplayed().catch(() => false);
+            if (isDisplayed) {
+              dialogFound = true;
+              log(`✅ Found WhatsApp permission popup`);
+              await this.saveScreenshot(driver, 'whatsapp-permission-popup', sessionId);
               break;
+            }
           }
         } catch (e) {
           continue;
         }
       }
 
-      if (isWhatsAppPermissionPopup) {
-        log(`🖱️ Clicking "Continue" on WhatsApp permission popup to allow contacts access...`);
-        
-        const continueSelectors = [
-          '//android.widget.Button[@text="Continue"]',
-          '//android.widget.Button[@text="CONTINUE"]',
-          '//*[@text="Continue"]',
-          '//*[@text="CONTINUE"]',
-          '//android.widget.TextView[@text="Continue"]',
-          '//*[contains(@text, "Continue")]',
+      if (dialogFound) {
+        const dismissButtonSelectors = [
+          '//android.widget.Button[@text="Not now"]',
+          '//android.widget.Button[@text="NOT NOW"]',
+          '//*[@text="Not now"]',
+          '//*[@text="NOT NOW"]',
+          '//android.widget.Button[contains(@text, "Not now")]',
+          '//android.widget.Button[@text="Deny"]',
+          '//android.widget.Button[@text="DENY"]',
+          '//*[@text="Deny"]',
+          '//*[@text="DENY"]',
+          '//android.widget.Button[contains(@text, "Deny")]',
         ];
 
-        let continueClicked = false;
-        for (const selector of continueSelectors) {
+        for (const selector of dismissButtonSelectors) {
           try {
-            const continueButton = await driver.$(selector);
-            const exists = await continueButton.isExisting().catch(() => false);
+            const dismissButton = await driver.$(selector);
+            const exists = await dismissButton.isExisting().catch(() => false);
             if (exists) {
-              const isDisplayed = await continueButton.isDisplayed().catch(() => false);
+              const isDisplayed = await dismissButton.isDisplayed().catch(() => false);
               if (isDisplayed) {
-                log(`✅ "Continue" button found, clicking...`);
-                await continueButton.click();
+                const buttonText = await dismissButton.getText().catch(() => '');
+                if (buttonText.toLowerCase().includes('not now') || buttonText.toLowerCase().includes('deny')) {
+                  log(`🚫 Clicking "${buttonText}" button on WhatsApp permission popup...`);
+                  await dismissButton.click();
                   await this.sleep(2000);
-                await this.saveScreenshot(driver, 'continue-clicked', sessionId, log);
-                continueClicked = true;
-                log(`✅ WhatsApp permission popup accepted! Contacts access granted.`);
-                
-                // After clicking Continue, Android might show native permission dialog
-                log(`🔍 Checking if Android native permission dialog appears after clicking Continue...`);
-                await this.sleep(1500);
-                
-                // Check for native Android permission
-                try {
-                  const activity = await driver.execute('mobile: getCurrentActivity').catch(() => '');
-                  if (activity.includes('GrantPermissionsActivity')) {
-                    log(`✅ Native Android permission dialog detected, handling it...`);
-                    
-                    // Click "Allow" on the native Android dialog
-                    const allowSelectors = [
-                      '//*[@resource-id="com.android.permissioncontroller:id/permission_allow_button"]',
-                      '//android.widget.Button[@text="Allow"]',
-                      '//android.widget.Button[@text="ALLOW"]',
-                      '//*[@text="Allow"]',
-                    ];
-                    
-                    // Loop to handle MULTIPLE Android permission dialogs (contacts, photos, etc.)
-                    let permissionDialogCount = 0;
-                    const maxPermissionDialogs = 5; // Handle up to 5 permission dialogs
-                    
-                    while (permissionDialogCount < maxPermissionDialogs) {
-                      await this.sleep(1000); // Wait for dialog to be ready
-                      
-                      // Check if still on permission dialog
-                      const currentActivityCheck = await driver.execute('mobile: getCurrentActivity');
-                      log(`🔍 Checking permission dialog ${permissionDialogCount + 1}/${maxPermissionDialogs} - Activity: ${currentActivityCheck}`);
-                      
-                      if (!currentActivityCheck.includes('GrantPermissionsActivity')) {
-                        log(`✅ All Android permission dialogs handled! Moved away from GrantPermissionsActivity`);
-                        break;
-                      }
-                      
-                      // Try to click Allow
-                      let allowClicked = false;
-                      for (const allowSelector of allowSelectors) {
-                        try {
-                          const allowButton = await driver.$(allowSelector);
-                          const allowExists = await allowButton.isExisting().catch(() => false);
-                          if (allowExists) {
-                            const allowDisplayed = await allowButton.isDisplayed().catch(() => false);
-                            if (allowDisplayed) {
-                              log(`✅ "Allow" button found on permission dialog ${permissionDialogCount + 1}, clicking...`);
-                              await allowButton.click();
-                              await this.sleep(2000);
-                              await this.saveScreenshot(driver, `native-allow-${permissionDialogCount + 1}-clicked`, sessionId, log);
-                              allowClicked = true;
-                              log(`✅ Permission dialog ${permissionDialogCount + 1} granted!`);
-                              break;
+                  log(`✅ WhatsApp permission popup dismissed`);
+                  await this.saveScreenshot(driver, 'whatsapp-permission-dismissed', sessionId);
+                  return;
+                }
               }
             }
           } catch (e) {
             continue;
           }
         }
-                      
-                      if (!allowClicked) {
-                        log(`⚠️ Could not click "Allow" on dialog ${permissionDialogCount + 1}, moving on...`);
-                        break; // Exit if no Allow button found
-                      }
-                      
-                      permissionDialogCount++;
-                    }
-                    
-                    if (permissionDialogCount === 0) {
-                      log(`ℹ️ No Allow button clicked, but continuing...`);
       } else {
-                      log(`✅ Handled ${permissionDialogCount} Android permission dialog(s)`);
-                    }
-                  } else {
-                    log(`ℹ️ No native permission dialog appeared, continuing...`);
-                }
-                } catch (e: any) {
-                  log(`⚠️ Error checking for native permission: ${e.message}`);
-                }
-                
-                break;
-              }
-            }
-          } catch (e) {
-            continue;
-          }
-        }
-        
-        if (!continueClicked) {
-          log(`⚠️ Could not click "Continue" button, but continuing...`);
-        }
-      } else {
-        log(`ℹ️ No WhatsApp permission popup detected either, continuing...`);
+        log(`ℹ️ No permission popup found, continuing...`);
       }
     } catch (error: any) {
       log(`⚠️ Error handling contact permission popup: ${error.message}, continuing...`);
@@ -4363,7 +3460,7 @@ ${message}
     try {
       log(`🔍 Checking for "Profile info" screen...`);
       await this.sleep(2000);
-      await this.saveScreenshot(driver, 'check-profile-info-screen', sessionId, log);
+      await this.saveScreenshot(driver, 'check-profile-info-screen', sessionId);
       
       // Check if we're on Profile info screen
       const profileScreenIndicators = [
@@ -4401,7 +3498,7 @@ ${message}
       const randomName = firstNames[Math.floor(Math.random() * firstNames.length)];
       
       log(`✅ Profile info screen detected! Filling name "${randomName}"...`);
-      await this.saveScreenshot(driver, 'profile-info-detected', sessionId, log);
+      await this.saveScreenshot(driver, 'profile-info-detected', sessionId);
       
       // Find name input field
       const nameInputSelectors = [
@@ -4445,7 +3542,7 @@ ${message}
       await nameInput.setValue(randomName);
       await this.sleep(1000);
       log(`✅ Name "${randomName}" entered successfully`);
-      await this.saveScreenshot(driver, 'name-entered', sessionId, log);
+      await this.saveScreenshot(driver, 'name-entered', sessionId);
       
       // Find and click Next button
       const nextButtonSelectors = [
@@ -4499,7 +3596,7 @@ ${message}
       
       if (buttonClicked) {
         log(`✅ Profile info completed successfully!`);
-        await this.saveScreenshot(driver, 'profile-info-completed', sessionId, log);
+        await this.saveScreenshot(driver, 'profile-info-completed', sessionId);
       } else {
         log(`⚠️ Could not find Next button on Profile info screen`);
       }
@@ -4517,37 +3614,28 @@ ${message}
     try {
       // Detect and log current screen
       log(`🔍 ==== ENTERING completeProfileSetup ====`);
-      await this.saveScreenshot(driver, 'profile-setup-start', sessionId, log);
       await this.detectCurrentScreen(driver, log);
       
-      // STEP 1: Handle contacts/media permission popup with active detection
-      log(`🔍 STEP 1: Actively detecting contacts/media permission popup...`);
+      // Take screenshot to see current state
+      await this.saveScreenshot(driver, 'profile-setup-start', sessionId);
+      log(`📸 Screenshot taken: profile-setup-start`);
+      
+      // Wait for screen to stabilize
+      await this.sleep(2000);
+      
+      // STEP 1: Handle contacts/media permission popup FIRST
+      log(`🔍 STEP 1: Checking for contacts/media permission popup...`);
       await this.handleContactPermissionPopup(driver, log, sessionId);
       
-      // STEP 2: Wait for WhatsApp to transition and check next screen after permissions
-      log(`🔍 STEP 2: Waiting for WhatsApp to transition after permissions...`);
-      await this.sleep(1500); // Give WhatsApp time to transition
-      await this.saveScreenshot(driver, 'after-permissions', sessionId, log);
-      let screenAfterPermissions = await this.detectCurrentScreen(driver, log);
+      // STEP 2: Wait for next screen and check if it's Profile info
+      log(`🔍 STEP 2: Waiting for next screen after permissions...`);
+      await this.sleep(3000);
+      await this.saveScreenshot(driver, 'after-permissions', sessionId);
+      await this.detectCurrentScreen(driver, log);
       
-      // If still on permission screen, wait a bit more and check again
-      if (screenAfterPermissions === 'UNKNOWN_SCREEN') {
-        const currentActivity = await driver.execute('mobile: getCurrentActivity');
-        if (currentActivity.includes('GrantPermissionsActivity')) {
-          log(`⚠️ Still on GrantPermissionsActivity, waiting 5 more seconds...`);
-          await this.sleep(5000);
-          await this.saveScreenshot(driver, 'after-permissions-retry', sessionId, log);
-          screenAfterPermissions = await this.detectCurrentScreen(driver, log);
-        }
-      }
-      
-      // STEP 3: Handle Profile info screen if present
-      if (screenAfterPermissions === 'PROFILE_INFO_SCREEN') {
-        log(`🔍 STEP 3: Profile info screen detected, handling...`);
+      // STEP 3: Check if we're on Profile info screen (first check)
+      log(`🔍 STEP 3: Checking for Profile info screen (first check)...`);
       await this.handleProfileInfoScreen(driver, log, sessionId);
-      } else {
-        log(`ℹ️ STEP 3: Profile info screen not detected (${screenAfterPermissions}), skipping...`);
-      }
       
       log(`✅ completeProfileSetup finished`);
       
@@ -4759,364 +3847,6 @@ ${message}
     }
   }
 
-  /**
-   * Send WhatsApp message using mobile:deepLink command
-   * This is the recommended method that works even if the contact is not saved
-   */
-  async sendWhatsAppMessage(phone: string, message: string, appiumPort: number, sessionId: string): Promise<void> {
-    const log = (msg: string) => {
-      logger.info(msg);
-      console.log(`💬 [WHATSAPP-MSG] ${msg}`);
-      
-      // Save log to database for live log display (async, no await)
-      (async () => {
-        try {
-          const { sessionService } = await import('./session.service');
-          await sessionService.createLog({
-            sessionId: sessionId,
-            level: 'info',
-            message: msg,
-            source: 'whatsapp-message',
-          });
-        } catch (e) {
-          // Ignore log save errors
-        }
-      })();
-    };
-    
-    log(`📤 Envoi de message WhatsApp`);
-    log(`📞 Destinataire: ${phone}`);
-    log(`💬 Message: ${message}`);
-    
-    let driver: any = null;
-    
-    try {
-      // Format phone number (remove non-numeric characters)
-      const phoneNumber = phone.replace(/[^0-9]/g, '');
-      
-      // URL encode the message
-      const encodedMessage = encodeURIComponent(message);
-      
-      // Build WhatsApp deeplink with whatsapp:// scheme
-      const deeplink = `whatsapp://send?phone=${phoneNumber}&text=${encodedMessage}`;
-      
-      log(`🔗 Deeplink: ${deeplink}`);
-      
-      // Connect to existing Appium session
-      log(`🔌 Connexion à Appium sur host.docker.internal:${appiumPort}...`);
-      await this.waitForAppium(appiumPort, 30000, log);
-      
-      driver = await remote({
-        hostname: 'host.docker.internal',
-        port: appiumPort,
-        path: '/',
-        capabilities: {
-          platformName: 'Android',
-          'appium:automationName': 'UiAutomator2',
-          'appium:deviceName': 'Android Emulator',
-          'appium:noReset': true,
-        },
-        logLevel: 'error',
-      });
-      
-      log(`✅ Connecté à Appium`);
-      
-      // Use mobile:deepLink command (best method for WhatsApp deeplinks)
-      log(`🚀 Ouverture du deeplink via mobile:deepLink...`);
-      
-      try {
-        await driver.execute('mobile:deepLink', {
-          url: deeplink,
-          package: 'com.whatsapp'
-        });
-        log(`✅ Deeplink envoyé avec succès via mobile:deepLink`);
-      } catch (deepLinkError: any) {
-        // Fallback to startActivity if mobile:deepLink is not available
-        log(`⚠️ mobile:deepLink non disponible, utilisation de startActivity...`);
-        await driver.execute('mobile: startActivity', {
-          action: 'android.intent.action.VIEW',
-          data: deeplink,
-          package: 'com.whatsapp'
-        });
-        log(`✅ Deeplink envoyé avec succès via startActivity`);
-      }
-      
-      // Wait for WhatsApp to process the deeplink
-      await this.sleep(3000);
-      
-      // Check if we're on the WhatsApp home screen with "Send message" button
-      log(`🔍 Vérification de la page d'accueil WhatsApp...`);
-      
-      try {
-        const homeScreenIndicators = [
-          '//*[@text="To help you message friends and family on WhatsApp, allow WhatsApp access to your contacts. Tap Settings > Permissions, and turn Contacts on."]',
-          '//*[contains(@text, "To help you message friends and family")]',
-          '//*[@text="Send message"]',
-        ];
-        
-        let foundHomeScreen = false;
-        for (const indicator of homeScreenIndicators) {
-          try {
-            const element = await driver.$(indicator);
-            const exists = await element.isExisting();
-            if (exists) {
-              foundHomeScreen = true;
-              log(`✅ Page d'accueil WhatsApp détectée`);
-              break;
-            }
-          } catch (e) {
-            continue;
-          }
-        }
-        
-        if (foundHomeScreen) {
-          // Click on "Send message" button
-          log(`🔍 Recherche du bouton "Send message"...`);
-          
-          const sendMessageSelectors = [
-            '//*[@text="Send message"]',
-            '//android.widget.Button[@text="Send message"]',
-            '//*[contains(@text, "Send message")]',
-          ];
-          
-          for (const selector of sendMessageSelectors) {
-            try {
-              const sendMessageButton = await driver.$(selector);
-              const exists = await sendMessageButton.isExisting();
-              if (exists) {
-                log(`✅ Bouton "Send message" trouvé, clic...`);
-                await sendMessageButton.click();
-                await this.sleep(2000);
-                log(`✅ Bouton "Send message" cliqué - passage à la sélection du contact`);
-                
-                // Take screenshot after clicking
-                await this.saveScreenshot(driver, 'whatsapp-after-send-message-click', sessionId, log);
-                break;
-              }
-            } catch (e) {
-              continue;
-            }
-          }
-        } else {
-          log(`ℹ️ Pas sur la page d'accueil WhatsApp, continue...`);
-        }
-      } catch (error: any) {
-        log(`ℹ️ Erreur lors de la vérification de la page d'accueil: ${error.message}`);
-      }
-      
-      // Handle "Open with" dialog if it appears
-      log(`🔍 Vérification de la popup "Open with"...`);
-      
-      try {
-        const whatsappSelectors = [
-          '//*[@text="WhatsApp"]',
-          '//android.widget.TextView[@text="WhatsApp"]',
-          '//*[contains(@text, "WhatsApp")]',
-        ];
-        
-        let whatsappClicked = false;
-        for (const selector of whatsappSelectors) {
-          try {
-            const whatsappOption = await driver.$(selector);
-            const exists = await whatsappOption.isExisting();
-            if (exists) {
-              log(`✅ Popup "Open with" détectée, sélection de WhatsApp...`);
-              await whatsappOption.click();
-              whatsappClicked = true;
-              log(`✅ WhatsApp sélectionné`);
-              
-              // Click "Always" button
-              await this.sleep(500);
-              const alwaysSelectors = [
-                '//*[@text="Always"]',
-                '//android.widget.Button[@text="Always"]',
-                '//*[contains(@text, "Always")]',
-              ];
-              
-              for (const alwaysSelector of alwaysSelectors) {
-                try {
-                  const alwaysButton = await driver.$(alwaysSelector);
-                  const alwaysExists = await alwaysButton.isExisting();
-                  if (alwaysExists) {
-                    log(`✅ Clic sur "Always"...`);
-                    await alwaysButton.click();
-                    log(`✅ WhatsApp défini comme application par défaut`);
-                    break;
-                  }
-                } catch (e) {
-                  continue;
-                }
-              }
-              
-              break;
-            }
-          } catch (e) {
-            continue;
-          }
-        }
-        
-        if (!whatsappClicked) {
-          log(`ℹ️ Pas de popup "Open with", WhatsApp s'est ouvert directement`);
-        }
-      } catch (error: any) {
-        log(`ℹ️ Pas de popup "Open with" à gérer`);
-      }
-      
-      // Wait for WhatsApp to load the conversation
-      await this.sleep(4000);
-      
-      // Handle "Sync contacts" screen if it appears
-      log(`🔍 Vérification de l'écran "Sync contacts"...`);
-      
-      try {
-        const syncContactsSelectors = [
-          '//*[@text="Sync contacts"]',
-          '//android.widget.Button[@text="Sync contacts"]',
-          '//*[contains(@text, "Sync contacts")]',
-        ];
-        
-        for (const syncSelector of syncContactsSelectors) {
-          try {
-            const syncButton = await driver.$(syncSelector);
-            const exists = await syncButton.isExisting();
-            if (exists) {
-              log(`✅ Écran "Sync contacts" détecté, clic...`);
-              await syncButton.click();
-              log(`✅ Synchronisation des contacts lancée`);
-              
-              // Wait for sync to complete
-              await this.sleep(3000);
-              log(`✅ Synchronisation terminée`);
-              break;
-            }
-          } catch (e) {
-            continue;
-          }
-        }
-      } catch (error: any) {
-        log(`ℹ️ Pas d'écran "Sync contacts" à gérer`);
-      }
-      
-      // Take screenshot to verify conversation is open
-      await this.saveScreenshot(driver, 'whatsapp-conversation-opened', sessionId, log);
-      log(`📸 Screenshot pris - conversation ouverte`);
-      
-      // Handle "Select contacts" / "Your contacts aren't synced" screen if it appears
-      log(`🔍 Vérification de l'écran "Select contacts"...`);
-      
-      try {
-        // Check for "Select contacts" title or "Your contacts aren't synced" text
-        const selectContactsIndicators = [
-          '//*[@text="Select contacts"]',
-          '//*[contains(@text, "Select contacts")]',
-          '//*[@text="Your contacts aren\'t synced"]',
-          '//*[contains(@text, "contacts aren\'t synced")]',
-        ];
-        
-        let foundSelectContacts = false;
-        for (const indicator of selectContactsIndicators) {
-          try {
-            const element = await driver.$(indicator);
-            const exists = await element.isExisting();
-            if (exists) {
-              foundSelectContacts = true;
-              log(`✅ Écran "Select contacts" détecté`);
-              break;
-            }
-          } catch (e) {
-            continue;
-          }
-        }
-        
-        if (foundSelectContacts) {
-          // Press back button to return to conversation
-          log(`⬅️ Clic sur le bouton retour pour revenir à la conversation...`);
-          await driver.back();
-          await this.sleep(2000);
-          log(`✅ Retour à la conversation`);
-          
-          // Take screenshot after going back
-          await this.saveScreenshot(driver, 'whatsapp-back-from-select-contacts', sessionId, log);
-        } else {
-          log(`ℹ️ Pas d'écran "Select contacts" détecté`);
-        }
-      } catch (error: any) {
-        log(`ℹ️ Pas d'écran "Select contacts" à gérer: ${error.message}`);
-      }
-      
-      // The message should be pre-filled, now click the send button
-      log(`📤 Recherche du bouton d'envoi...`);
-      
-      try {
-        const sendButtonSelectors = [
-          '//*[@resource-id="com.whatsapp:id/send"]',
-          '//*[@content-desc="Send"]',
-          '//android.widget.ImageButton[@content-desc="Send"]',
-          '//*[@content-desc="Send message"]',
-        ];
-        
-        let sendButtonClicked = false;
-        for (const sendSelector of sendButtonSelectors) {
-          try {
-            const sendButton = await driver.$(sendSelector);
-            const exists = await sendButton.isExisting();
-            if (exists) {
-              const isDisplayed = await sendButton.isDisplayed().catch(() => false);
-              if (isDisplayed) {
-                log(`✅ Bouton d'envoi trouvé, clic...`);
-                await sendButton.click();
-                sendButtonClicked = true;
-                log(`✅ Message envoyé avec succès !`);
-                await this.sleep(2000);
-                
-                // Take screenshot after sending
-                await this.saveScreenshot(driver, 'whatsapp-message-sent', sessionId, log);
-                log(`📸 Screenshot pris - message envoyé`);
-                break;
-              }
-            }
-          } catch (e) {
-            continue;
-          }
-        }
-        
-        if (!sendButtonClicked) {
-          log(`⚠️ Bouton d'envoi non trouvé - vérifier l'état de la conversation`);
-          await this.saveScreenshot(driver, 'whatsapp-send-button-not-found', sessionId, log);
-        }
-      } catch (error: any) {
-        log(`⚠️ Erreur lors de l'envoi: ${error.message}`);
-        await this.saveScreenshot(driver, 'whatsapp-send-error', sessionId, log);
-      }
-      
-      log(`✅ Message WhatsApp traité avec succès !`);
-      
-    } catch (error: any) {
-      log(`❌ Échec de l'envoi du message WhatsApp: ${error.message}`);
-      logger.error({ error: error.message, sessionId, phone }, 'WhatsApp message failed');
-      throw error;
-    } finally {
-      // Keep the driver alive for message polling
-      if (driver) {
-        log(`ℹ️ Session Appium maintenue active`);
-      }
-    }
-  }
-
-  /**
-   * Send message via deeplink using existing Appium session
-   * @deprecated Use sendWhatsAppMessage instead
-   */
-  async sendMessageViaDeeplink(options: {
-    appiumPort: number;
-    to: string;
-    message: string;
-    sessionId: string;
-  }): Promise<void> {
-    // Delegate to new sendWhatsAppMessage method
-    return this.sendWhatsAppMessage(options.to, options.message, options.appiumPort, options.sessionId);
-  }
-
   async sendMessage(options: {
     appiumPort: number;
     sessionId: string;
@@ -5227,7 +3957,7 @@ ${message}
       log(`❌ Message sending failed: ${error.message}`);
       logger.error({ error: error.message, sessionId, to }, 'Message sending failed');
       if (driver) {
-        await this.saveScreenshot(driver, 'message-send-error', sessionId, log);
+        await this.saveScreenshot(driver, 'message-send-error', sessionId);
       }
       throw error;
     } finally {
@@ -5238,1251 +3968,6 @@ ${message}
         } catch (e) {
           // Ignore
         }
-      }
-    }
-  }
-
-  /**
-   * Create a WhatsApp contact by navigating through the WhatsApp UI
-   * Clicks on + button, New Contact, fills form with random names and phone number
-   */
-  async createWhatsAppContact(options: {
-    appiumPort: number;
-    sessionId: string;
-    phoneNumber: string;
-    firstName?: string;
-    lastName?: string;
-    onLog?: (msg: string) => Promise<void>;
-  }): Promise<boolean> {
-    const { appiumPort, sessionId, phoneNumber, firstName, lastName, onLog: onLogCallback } = options;
-    
-    // Generate random names if not provided
-    const firstNames = ['Jean', 'Marie', 'Pierre', 'Sophie', 'Lucas', 'Emma', 'Thomas', 'Julie', 'Antoine', 'Léa'];
-    const lastNames = ['Dupont', 'Martin', 'Bernard', 'Dubois', 'Thomas', 'Robert', 'Petit', 'Richard', 'Durand', 'Leroy'];
-    
-    const randomFirstName = firstName || firstNames[Math.floor(Math.random() * firstNames.length)];
-    const randomLastName = lastName || lastNames[Math.floor(Math.random() * lastNames.length)];
-    
-    const log = (msg: string) => {
-      logger.info(msg);
-      console.log(`📇 [CONTACT] ${msg}`);
-      // Call the callback asynchronously without waiting (fire-and-forget for better performance)
-      if (onLogCallback) {
-        onLogCallback(msg).catch((err) => {
-          logger.warn({ err }, 'Failed to call onLog callback');
-        });
-      }
-    };
-    
-    log(`📇 Création d'un contact WhatsApp via UI`);
-    log(`👤 Prénom: ${randomFirstName}`);
-    log(`👤 Nom: ${randomLastName}`);
-    log(`📞 Téléphone: ${phoneNumber}`);
-    
-    let driver: any = null;
-    
-    try {
-      // Connect to Appium
-      log(`🔌 Connexion à Appium sur host.docker.internal:${appiumPort}...`);
-      await this.waitForAppium(appiumPort, 30000, log);
-      
-      driver = await remote({
-        hostname: 'host.docker.internal',
-        port: appiumPort,
-        path: '/',
-        capabilities: {
-          platformName: 'Android',
-          'appium:automationName': 'UiAutomator2',
-          'appium:deviceName': 'Android Emulator',
-          'appium:appPackage': 'com.whatsapp',
-          'appium:appActivity': '.HomeActivity',
-          'appium:noReset': true,
-          'appium:fullReset': false,
-        },
-        logLevel: 'error',
-        connectionRetryTimeout: 90000,
-        connectionRetryCount: 3,
-      });
-      
-      log(`✅ Connecté à la page d'accueil WhatsApp`);
-      await this.sleep(2000);
-      await this.saveScreenshot(driver, 'whatsapp-home', sessionId, log);
-      
-      // STEP 1: Click "Send message" or "Start chatting" button to access "Select Contact" screen
-      log(`🔍 Clic sur "Send message" / "Start chatting"...`);
-      
-      const sendMessageSelectors = [
-        '//*[@text="Send message"]',
-        '//android.widget.Button[@text="Send message"]',
-        '//android.widget.TextView[@text="Send message"]',
-        '//*[@text="Start chatting"]',
-        '//android.widget.Button[@text="Start chatting"]',
-        '//android.widget.TextView[@text="Start chatting"]',
-        '//*[contains(@text, "Send message")]',
-        '//*[contains(@text, "Start chatting")]',
-        '//*[@content-desc="Send message"]',
-        '//*[@content-desc="Start chatting"]',
-      ];
-      
-      let sendMessageFound = false;
-      for (const selector of sendMessageSelectors) {
-        try {
-          const sendMessageButton = await driver.$(selector);
-          const exists = await sendMessageButton.isExisting().catch(() => false);
-          if (exists) {
-            const isDisplayed = await sendMessageButton.isDisplayed().catch(() => false);
-            if (isDisplayed) {
-              await sendMessageButton.click();
-              sendMessageFound = true;
-              log(`✅ Bouton "Send message" / "Start chatting" cliqué`);
-              await this.sleep(2000);
-              await this.saveScreenshot(driver, 'send-message-clicked', sessionId, log);
-              break;
-            }
-          }
-        } catch (e: any) {
-          continue;
-        }
-      }
-      
-      // If Send message button not found, throw error
-      if (!sendMessageFound) {
-        log(`❌ Bouton "Send message" / "Start chatting" non trouvé`);
-        throw new Error('Impossible de trouver le bouton "Send message" ou "Start chatting" sur la homepage');
-      }
-      
-      // STEP 2: Now we should be on "Select Contact" screen, click "New contact"
-      log(`📇 Recherche du bouton "New contact"...`);
-      await this.sleep(2000);
-      await this.saveScreenshot(driver, 'select-contact-screen', sessionId, log);
-      
-      const newContactSelectors = [
-        '//*[@content-desc="New contact"]',
-        '//*[@resource-id="com.whatsapp:id/menuitem_new_contact"]',
-        '//android.widget.TextView[@text="New contact"]',
-        '//*[@text="New contact"]',
-        '//android.widget.TextView[@text="Nouveau contact"]',
-        '//*[@text="Nouveau contact"]',
-        '//*[contains(@content-desc, "contact")]',
-        '//*[contains(@text, "New") and contains(@text, "contact")]',
-      ];
-      
-      let newContactFound = false;
-      for (const selector of newContactSelectors) {
-        try {
-          const newContactButton = await driver.$(selector);
-          const exists = await newContactButton.isExisting();
-          if (exists) {
-            const isDisplayed = await newContactButton.isDisplayed().catch(() => false);
-            if (isDisplayed) {
-              await newContactButton.click();
-              log(`✅ Bouton "New contact" cliqué`);
-              newContactFound = true;
-              await this.sleep(2000);
-              await this.saveScreenshot(driver, 'new-contact-clicked', sessionId, log);
-              
-              // Check for "More ways to manage contacts" popup AFTER clicking New contact
-              try {
-                const currentActivity = await driver.getCurrentActivity();
-                
-                // Check if we're on the privacy disclosure popup
-                if (currentActivity && currentActivity.includes('PrivacyDisclosure')) {
-                  log(`🔍 Popup "More ways to manage contacts" détecté, clic sur OK...`);
-                  await this.saveScreenshot(driver, 'privacy-popup-detected', sessionId, log);
-                  
-                  const okSelectors = [
-                    '//android.widget.Button[@text="OK"]',
-                    '//*[@text="OK"]',
-                    '//android.widget.TextView[@text="OK"]',
-                    '//*[contains(@text, "OK")]',
-                    '//android.widget.Button[contains(@text, "OK")]',
-                  ];
-                  
-                  for (const selector of okSelectors) {
-                    try {
-                      const okBtn = await driver.$(selector);
-                      const exists = await okBtn.isExisting();
-                      if (exists) {
-                        const isDisplayed = await okBtn.isDisplayed().catch(() => false);
-                        if (isDisplayed) {
-                          await okBtn.click();
-                          log(`✅ Popup "OK" cliqué`);
-                          await this.sleep(2000);
-                          await this.saveScreenshot(driver, 'privacy-popup-ok-clicked', sessionId, log);
-                          break;
-                        }
-                      }
-                    } catch (e: any) {
-                      log(`      ❌ Erreur: ${e.message}`);
-                      continue;
-                    }
-                  }
-}
-              } catch (e: any) {
-                // Ignore popup check errors
-              }
-              
-              break;
-            }
-          }
-        } catch (e: any) {
-          continue;
-        }
-      }
-      
-      if (!newContactFound) {
-        log(`❌ Bouton "New contact" non trouvé`);
-        throw new Error('Bouton "New contact" non trouvé sur la page de sélection');
-      }
-      
-      // STEP 3: Fill first name
-      log(`📝 Remplissage du formulaire de contact...`);
-      const firstNameSelectors = [
-        '//*[@text="First name"]',
-        '//android.widget.EditText[@text="First name"]',
-        '//*[@resource-id="com.whatsapp:id/first_name"]',
-        '//android.widget.EditText[contains(@text, "First")]',
-        '(//android.widget.EditText)[1]',
-      ];
-      
-      let firstNameFilled = false;
-      for (const selector of firstNameSelectors) {
-        try {
-          const firstNameField = await driver.$(selector);
-          const exists = await firstNameField.isExisting();
-          if (exists) {
-            const isDisplayed = await firstNameField.isDisplayed().catch(() => false);
-            if (isDisplayed) {
-              await firstNameField.click();
-              await this.sleep(500);
-              await firstNameField.setValue(randomFirstName);
-              firstNameFilled = true;
-              log(`✅ Prénom saisi: ${randomFirstName}`);
-              await this.sleep(1000);
-              await this.saveScreenshot(driver, 'first-name-filled', sessionId, log);
-              break;
-            }
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-      
-      if (!firstNameFilled) {
-        throw new Error('Champ "First name" non trouvé');
-      }
-      
-      // STEP 4: Fill last name
-      const lastNameSelectors = [
-        '//*[@text="Last name"]',
-        '//android.widget.EditText[@text="Last name"]',
-        '//*[@resource-id="com.whatsapp:id/last_name"]',
-        '//android.widget.EditText[contains(@text, "Last")]',
-        '(//android.widget.EditText)[2]',
-      ];
-      
-      let lastNameFilled = false;
-      for (const selector of lastNameSelectors) {
-        try {
-          const lastNameField = await driver.$(selector);
-          const exists = await lastNameField.isExisting();
-          if (exists) {
-            const isDisplayed = await lastNameField.isDisplayed().catch(() => false);
-            if (isDisplayed) {
-              await lastNameField.click();
-              await this.sleep(500);
-              await lastNameField.setValue(randomLastName);
-              lastNameFilled = true;
-              log(`✅ Nom saisi: ${randomLastName}`);
-              await this.sleep(1000);
-              await this.saveScreenshot(driver, 'last-name-filled', sessionId, log);
-              
-              // Hide keyboard to reveal Country/Phone fields
-              try {
-                await driver.hideKeyboard();
-                await this.sleep(1000);
-              } catch (e: any) {
-                try {
-                  await driver.pressKeyCode(4); // Back button
-                  await this.sleep(1000);
-                } catch (e2: any) {
-                  // Ignore
-                }
-              }
-              break;
-            }
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-      
-      if (!lastNameFilled) {
-        throw new Error('Champ "Last name" non trouvé');
-      }
-      
-      // STEP 5: Scroll down to reveal Country and Phone fields
-      log(`📜 Scroll pour afficher les champs pays/téléphone...`);
-      await this.sleep(1000);
-      
-      try {
-        await driver.execute('mobile: scrollGesture', {
-          left: 300,
-          top: 800,
-          width: 400,
-          height: 600,
-          direction: 'down',
-          percent: 3.0
-        });
-        await this.sleep(1500);
-        await this.saveScreenshot(driver, 'after-scroll', sessionId, log);
-      } catch (scrollError: any) {
-        // Ignore scroll errors
-      }
-      
-      // STEP 6: Click on Country dropdown to change to Israel (+972)
-      const countrySelectors = [
-        '//*[@text="Country"]',
-        '//android.widget.EditText[@text="Country"]',
-        '//*[contains(@text, "US +1")]',
-        '//*[contains(@text, "United States")]',
-        '//android.widget.Spinner',
-        '//*[@resource-id="com.whatsapp:id/country"]',
-        '(//android.widget.EditText)[1]',
-      ];
-      
-      for (const selector of countrySelectors) {
-        try {
-          const countryDropdown = await driver.$(selector);
-          const exists = await countryDropdown.isExisting();
-          if (exists) {
-            const isDisplayed = await countryDropdown.isDisplayed().catch(() => false);
-            if (isDisplayed) {
-              await countryDropdown.click();
-              log(`✅ Dropdown pays ouvert`);
-              await this.sleep(2000);
-              await this.saveScreenshot(driver, 'country-dropdown-opened', sessionId, log);
-              break;
-            }
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-      
-      // STEP 7: Search and select Israel (+972) using the search icon
-      log(`🇮🇱 Recherche d'Israël via la loupe de recherche...`);
-      
-      // Click on search icon (magnifying glass)
-      const searchIconSelectors = [
-        '//*[@content-desc="Search"]',
-        '//android.widget.ImageButton[@content-desc="Search"]',
-        '//*[contains(@content-desc, "Search")]',
-        '//android.widget.TextView[@content-desc="Search"]',
-      ];
-      
-      let searchClicked = false;
-      for (const selector of searchIconSelectors) {
-        try {
-          const searchIcon = await driver.$(selector);
-          const exists = await searchIcon.isExisting().catch(() => false);
-          if (exists) {
-            const isDisplayed = await searchIcon.isDisplayed().catch(() => false);
-            if (isDisplayed) {
-              await searchIcon.click();
-              log(`✅ Loupe de recherche cliquée`);
-              searchClicked = true;
-              await this.sleep(500);
-              break;
-            }
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-      
-      if (searchClicked) {
-        // Type "Israel" in the search field
-        const searchFieldSelectors = [
-          '//android.widget.EditText',
-          '//*[@resource-id="android:id/search_src_text"]',
-          '//*[contains(@hint, "Search")]',
-        ];
-        
-        for (const selector of searchFieldSelectors) {
-          try {
-            const searchField = await driver.$(selector);
-            const exists = await searchField.isExisting().catch(() => false);
-            if (exists) {
-              await searchField.setValue('Israel');
-              log(`✅ "Israel" tapé dans la recherche`);
-              await this.sleep(2000); // Wait for search results to appear
-              await this.saveScreenshot(driver, 'after-search-israel', sessionId, log);
-              break;
-            }
-          } catch (e) {
-            continue;
-          }
-        }
-      }
-      
-      // Select Israel - The result row is BELOW the search bar
-      // IMPORTANT: //*[@text="Israel"] finds the search bar first! We need to find the SECOND one or use +972/ישראל
-      log(`🔍 Sélection d'Israel dans la ligne de résultat (pas la barre de recherche)...`);
-      
-      let israelSelected = false;
-      
-      // METHOD 1: Click on "+972" - this text ONLY exists in the result row, not in search bar
-      if (!israelSelected) {
-        try {
-          const plus972Elem = await driver.$('//*[@text="+972"]');
-          if (await plus972Elem.isExisting()) {
-            const loc = await plus972Elem.getLocation();
-            log(`📍 +972 trouvé à (${loc.x}, ${loc.y})`);
-            
-            log(`🖱️ Méthode 1: Clic sur +972...`);
-            await plus972Elem.click();
-            await this.sleep(2000);
-            
-            const activity = await driver.getCurrentActivity();
-            if (!activity.includes('CountryPicker')) {
-              israelSelected = true;
-              log(`✅ Israel sélectionné via +972`);
-            } else {
-              log(`⚠️ Méthode 1 échouée`);
-            }
-          }
-        } catch (e: any) {
-          log(`⚠️ +972 error: ${e.message}`);
-        }
-      }
-      
-      // METHOD 2: Click on Hebrew text "ישראל" - also ONLY in result row
-      if (!israelSelected) {
-        try {
-          const hebrewElem = await driver.$('//*[@text="ישראל"]');
-          if (await hebrewElem.isExisting()) {
-            const loc = await hebrewElem.getLocation();
-            log(`📍 ישראל trouvé à (${loc.x}, ${loc.y})`);
-            
-            log(`🖱️ Méthode 2: Clic sur ישראל...`);
-            await hebrewElem.click();
-            await this.sleep(2000);
-            
-            const activity = await driver.getCurrentActivity();
-            if (!activity.includes('CountryPicker')) {
-              israelSelected = true;
-              log(`✅ Israel sélectionné via ישראל`);
-            } else {
-              log(`⚠️ Méthode 2 échouée`);
-            }
-          }
-        } catch (e: any) {
-          log(`⚠️ ישראל error: ${e.message}`);
-        }
-      }
-      
-      // METHOD 3: Get the SECOND "Israel" element (first is in search bar, second is in result row)
-      if (!israelSelected) {
-        try {
-          const israelElements = await driver.$$('//*[@text="Israel"]');
-          log(`📍 Nombre d'éléments "Israel" trouvés: ${israelElements.length}`);
-          
-          if (israelElements.length >= 2) {
-            const secondIsrael = israelElements[1]; // Index 1 = second element
-            const loc = await secondIsrael.getLocation();
-            log(`📍 Second "Israel" trouvé à (${loc.x}, ${loc.y})`);
-            
-            log(`🖱️ Méthode 3: Clic sur le DEUXIÈME "Israel"...`);
-            await secondIsrael.click();
-            await this.sleep(2000);
-            
-            const activity = await driver.getCurrentActivity();
-            if (!activity.includes('CountryPicker')) {
-              israelSelected = true;
-              log(`✅ Israel sélectionné via second element`);
-            } else {
-              log(`⚠️ Méthode 3 échouée`);
-            }
-          } else if (israelElements.length === 1) {
-            // Only one Israel element - try clicking it anyway
-            const loc = await israelElements[0].getLocation();
-            log(`📍 Un seul "Israel" trouvé à (${loc.x}, ${loc.y})`);
-            
-            // If Y > 150, it's in the result row, not search bar
-            if (loc.y > 150) {
-              log(`🖱️ Méthode 3: Clic sur l'unique "Israel" (Y=${loc.y} > 150)...`);
-              await israelElements[0].click();
-              await this.sleep(2000);
-              
-              const activity = await driver.getCurrentActivity();
-              if (!activity.includes('CountryPicker')) {
-                israelSelected = true;
-                log(`✅ Israel sélectionné`);
-              }
-            }
-          }
-        } catch (e: any) {
-          log(`⚠️ Second Israel error: ${e.message}`);
-        }
-      }
-      
-      // METHOD 4: Use coordinates - the result row is at approximately Y=240
-      if (!israelSelected) {
-        try {
-          const windowSize = await driver.getWindowSize();
-          const x = Math.round(windowSize.width / 2);
-          const y = 245; // Below search bar, in result row area
-          
-          log(`📍 Méthode 4: Tap à (${x}, ${y})...`);
-          await driver.execute('mobile: clickGesture', { x, y });
-          await this.sleep(2000);
-          
-          const activity = await driver.getCurrentActivity();
-          if (!activity.includes('CountryPicker')) {
-            israelSelected = true;
-            log(`✅ Israel sélectionné via coordonnées`);
-          } else {
-            log(`⚠️ Méthode 4 échouée`);
-          }
-        } catch (e: any) {
-          log(`⚠️ Coordonnées error: ${e.message}`);
-        }
-      }
-      
-      // Check final result
-      await this.saveScreenshot(driver, 'israel-selection-result', sessionId, log);
-      const currentActivity = await driver.getCurrentActivity();
-      
-      if (currentActivity.includes('CountryPicker')) {
-        log(`❌ ÉCHEC TOTAL: Impossible de sélectionner Israel après 4 méthodes`);
-        log(`📱 L'écran CountryPicker est toujours affiché`);
-        // Do NOT proceed - return false to indicate failure
-        return false;
-      } else {
-        log(`✅ CountryPicker fermé, Israel sélectionné avec succès`);
-      }
-      
-      await this.saveScreenshot(driver, 'after-country-selection', sessionId, log);
-      
-      // STEP 8: Fill phone number field
-      log(`📞 Saisie du numéro: ${phoneNumber}...`);
-      
-      const phoneSelectors = [
-        '//*[@text="Phone"]',
-        '//android.widget.EditText[@text="Phone"]',
-        '//*[@resource-id="com.whatsapp:id/phone"]',
-        '//android.widget.EditText[contains(@text, "Phone")]',
-        '//android.widget.EditText[contains(@hint, "Phone")]',
-      ];
-      
-      for (const selector of phoneSelectors) {
-        try {
-          const phoneField = await driver.$(selector);
-          const exists = await phoneField.isExisting();
-          if (exists) {
-            const isDisplayed = await phoneField.isDisplayed().catch(() => false);
-            if (isDisplayed) {
-              await phoneField.click();
-              await this.sleep(500);
-              await phoneField.setValue(phoneNumber);
-              log(`✅ Numéro saisi: ${phoneNumber}`);
-              await this.sleep(1500);
-              await this.saveScreenshot(driver, 'phone-filled', sessionId, log);
-              break;
-            }
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-      
-      // STEP 9: Click Save button (FINAL)
-      log(`💾 Sauvegarde du contact...`);
-      await this.sleep(1000);
-      
-      const saveButtonSelectors = [
-        '//android.widget.Button[@text="SAVE"]',
-        '//android.widget.Button[@text="Save"]',
-        '//android.widget.TextView[@text="SAVE"]',
-        '//android.widget.TextView[@text="Save"]',
-        '//*[@content-desc="Save"]',
-        '//*[contains(@text, "SAVE")]',
-      ];
-      
-      for (const selector of saveButtonSelectors) {
-        try {
-          const saveButton = await driver.$(selector);
-          const exists = await saveButton.isExisting();
-          if (exists) {
-            const isDisplayed = await saveButton.isDisplayed().catch(() => false);
-            if (isDisplayed) {
-              await saveButton.click();
-              log(`✅ Contact sauvegardé !`);
-              await this.sleep(1500);
-              await this.saveScreenshot(driver, 'contact-saved', sessionId, log);
-              break;
-            }
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-      
-      log(`✅ Contact WhatsApp créé: ${randomFirstName} ${randomLastName} - ${phoneNumber}`);
-      
-      // STEP 10: Click on the created contact in the list to open chat
-      log(`📱 Recherche du contact créé dans la liste pour ouvrir le chat...`);
-      await this.sleep(2000);
-      await this.saveScreenshot(driver, 'after-save', sessionId, log);
-      
-      const contactName = `${randomFirstName} ${randomLastName}`;
-      const contactSelectors = [
-        `//*[@text="${contactName}"]`,
-        `//android.widget.TextView[@text="${contactName}"]`,
-        `//*[contains(@text, "${randomFirstName}")]`,
-        `//*[contains(@text, "${randomLastName}")]`,
-      ];
-      
-      let contactClicked = false;
-      for (const selector of contactSelectors) {
-        try {
-          const contactElement = await driver.$(selector);
-          const exists = await contactElement.isExisting();
-          if (exists) {
-            const isDisplayed = await contactElement.isDisplayed().catch(() => false);
-            if (isDisplayed) {
-              await contactElement.click();
-              log(`✅ Contact "${contactName}" cliqué, ouverture du chat...`);
-              contactClicked = true;
-              await this.sleep(1500);
-              await this.saveScreenshot(driver, 'contact-chat-opened', sessionId, log);
-              break;
-            }
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-      
-      if (!contactClicked) {
-        log(`⚠️ Contact non trouvé dans la liste, fin de l'automatisation`);
-        return false;
-      }
-      
-      // STEP 11: Send a test message in the chat
-      log(`💬 Envoi d'un message de test...`);
-      await this.sleep(2000);
-      
-      const testMessage = `Bonjour ! Ceci est un message de test automatique. 👋`;
-      
-      // Find the message input field
-      const messageInputSelectors = [
-        '//*[@resource-id="com.whatsapp:id/entry"]',
-        '//android.widget.EditText[@content-desc="Message"]',
-        '//*[@text="Message"]',
-        '//android.widget.EditText[contains(@hint, "Message")]',
-        '(//android.widget.EditText)[1]',
-      ];
-      
-      let messageTyped = false;
-      for (const selector of messageInputSelectors) {
-        try {
-          const messageInput = await driver.$(selector);
-          const exists = await messageInput.isExisting();
-          if (exists) {
-            const isDisplayed = await messageInput.isDisplayed().catch(() => false);
-            if (isDisplayed) {
-              await messageInput.click();
-              await this.sleep(500);
-              await messageInput.setValue(testMessage);
-              log(`✅ Message tapé: "${testMessage}"`);
-              messageTyped = true;
-              await this.sleep(1000);
-              await this.saveScreenshot(driver, 'message-typed', sessionId, log);
-              break;
-            }
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-      
-      if (!messageTyped) {
-        log(`⚠️ Champ de message non trouvé, impossible d'envoyer le message`);
-        return false;
-      }
-      
-      // Click the send button (arrow)
-      const sendButtonSelectors = [
-        '//*[@content-desc="Send"]',
-        '//*[@resource-id="com.whatsapp:id/send"]',
-        '//android.widget.ImageButton[@content-desc="Send"]',
-        '//*[contains(@content-desc, "Send")]',
-      ];
-      
-      for (const selector of sendButtonSelectors) {
-        try {
-          const sendButton = await driver.$(selector);
-          const exists = await sendButton.isExisting();
-          if (exists) {
-            const isDisplayed = await sendButton.isDisplayed().catch(() => false);
-            if (isDisplayed) {
-              await sendButton.click();
-              log(`✅ Message envoyé avec succès ! 📨`);
-              await this.sleep(2000);
-              await this.saveScreenshot(driver, 'message-sent', sessionId, log);
-              break;
-            }
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-      
-      log(`🎉 Contact créé et message envoyé avec succès !`);
-      return true;
-      
-    } catch (error: any) {
-      log(`❌ Échec de la création du contact: ${error.message}`);
-      logger.error({ error: error.message, sessionId, phoneNumber }, 'Failed to create WhatsApp contact');
-      if (driver) {
-        await this.saveScreenshot(driver, 'contact-creation-error', sessionId, log);
-      }
-      return false;
-    } finally {
-      if (driver) {
-        try {
-          await driver.deleteSession();
-          log(`🔌 Session Appium fermée`);
-        } catch (e) {
-          // Ignore cleanup errors
-        }
-      }
-    }
-  }
-
-  /**
-   * Create an Android contact using ADB Intent + Save button click
-   * Simple and reliable method that doesn't rely on UI field detection
-   */
-  async createAndroidContact(appiumPort: number, sessionId: string, contactName: string, phoneNumber: string): Promise<void> {
-    // IMPORTANT: Make logs SYNCHRONOUS so they appear in real-time in the live log
-    const logWithLevel = async (msg: string, level: 'info' | 'warn' | 'error' = 'info'): Promise<void> => {
-      const emoji = level === 'error' ? '❌' : level === 'warn' ? '⚠️' : 'ℹ️';
-      const formattedMessage = `${emoji} ${msg}`;
-      
-      logger.info(formattedMessage);
-      console.log(`📇 [CONTACT] ${formattedMessage}`);
-      
-      // Save log to database SYNCHRONOUSLY (await it)
-      try {
-        const { sessionService } = await import('./session.service');
-        await sessionService.createLog({
-          sessionId: sessionId,
-          level: level,
-          message: msg,
-          source: 'android-contact',
-        });
-      } catch (e) {
-        // Ignore save errors but continue
-        console.error(`Failed to save log: ${e}`);
-      }
-    };
-    
-    // Simple log function for saveScreenshot and logCurrentScreen
-    const log = async (msg: string): Promise<void> => await logWithLevel(msg, 'info');
-    
-    await log(`📇 Création d'un contact Android via ADB Intent`);
-    await log(`👤 Nom: ${contactName}`);
-    await log(`📞 Téléphone: ${phoneNumber}`);
-    
-    let driver: any = null;
-    
-    try {
-      // Connect to Appium
-      await log(`🔌 Connexion à Appium sur host.docker.internal:${appiumPort}...`);
-      await this.waitForAppium(appiumPort, 30000, log);
-      
-      driver = await remote({
-        hostname: 'host.docker.internal',
-        port: appiumPort,
-        path: '/',
-        capabilities: {
-          platformName: 'Android',
-          'appium:automationName': 'UiAutomator2',
-          'appium:deviceName': 'Android Emulator',
-          'appium:noReset': true,
-        },
-        logLevel: 'error',
-      });
-      
-      await log(`✅ Connecté à Appium`);
-      
-      // STEP 1: Create a local device-only account to enable contact creation
-      await log(`🔧 Création d'un compte local Android pour activer la création de contacts...`);
-      try {
-        const accountResult = await driver.execute('mobile: shell', {
-          command: 'content',
-          args: [
-            'insert',
-            '--uri', 'content://com.android.contacts/accounts',
-            '--bind', 'name:s:local',
-            '--bind', 'type:s:com.android.local'
-          ],
-        });
-        await log(`✅ Compte local créé: ${accountResult}`);
-        await this.sleep(1000); // Wait for account to be registered
-      } catch (accountError: any) {
-        // If account already exists, this is fine
-        await log(`ℹ️ Compte local (peut-être déjà existant): ${accountError.message}`);
-      }
-      
-      // STEP 2: Use ADB Intent to open contact form with pre-filled data
-      await log(`📱 Lancement de l'Intent Android pour créer un contact...`);
-      await log(`🔧 Intent: android.intent.action.INSERT avec name="${contactName}" et phone="${phoneNumber}"`);
-      
-      const result = await driver.execute('mobile: shell', {
-        command: 'am',
-        args: [
-          'start',
-          '-a', 'android.intent.action.INSERT',
-          '-t', 'vnd.android.cursor.dir/contact',
-          '-e', 'name', contactName,
-          '-e', 'phone', phoneNumber
-        ],
-      });
-      
-      await log(`✅ Intent lancé: ${result}`);
-      
-      // Wait for the form to open
-      await this.sleep(3000);
-      await this.saveScreenshot(driver, 'contact-form-opened-with-data', sessionId, log);
-      await this.logCurrentScreen(driver, sessionId, log);
-      
-      // Click Save button
-      await log(`💾 Recherche du bouton "Save" / "Enregistrer"...`);
-      const saveSelectors = [
-        '//android.widget.Button[@text="SAVE"]',
-        '//android.widget.Button[@text="Save"]',
-        '//android.widget.TextView[@text="SAVE"]',
-        '//android.widget.TextView[@text="Save"]',
-        '//*[@resource-id="editor_menu_save_button"]',
-        '//*[@content-desc="Save"]',
-        '//*[@content-desc="SAVE"]',
-        '//*[contains(@text, "Save")]',
-        '//*[contains(@text, "SAVE")]',
-        '//android.widget.Button[contains(@text, "Save")]',
-        '//android.widget.TextView[contains(@text, "Save")]',
-      ];
-      
-      let saveButtonFound = false;
-      for (const selector of saveSelectors) {
-        try {
-          await log(`  🔍 Essai du sélecteur: ${selector}`);
-          const saveButton = await driver.$(selector);
-          const exists = await saveButton.isExisting();
-          if (exists) {
-            const isDisplayed = await saveButton.isDisplayed().catch(() => false);
-            if (isDisplayed) {
-              await log(`✅ Bouton "Save" trouvé avec: ${selector}`);
-              await saveButton.click();
-              await log(`✅ Bouton "Save" cliqué`);
-              saveButtonFound = true;
-              await this.sleep(2000);
-              await this.saveScreenshot(driver, 'contact-saved', sessionId, log);
-              break;
-            }
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-      
-      if (!saveButtonFound) {
-        await logWithLevel(`⚠️ Bouton "Save" non trouvé, tentative avec le bouton Back...`, 'warn');
-        // Try pressing back button to save
-        await driver.back();
-        await this.sleep(2000);
-        await this.saveScreenshot(driver, 'contact-back-pressed', sessionId, log);
-      }
-      
-      // STEP 3: Verify contact was created by checking if it exists in contacts
-      await log(`🔍 Vérification que le contact a bien été créé...`);
-      
-      // Query the contacts database to verify the contact exists
-      try {
-        const queryResult = await driver.execute('mobile: shell', {
-          command: 'content',
-          args: [
-            'query',
-            '--uri', 'content://com.android.contacts/data',
-            '--projection', 'display_name:data1',
-            '--where', `display_name='${contactName}'`
-          ],
-        });
-        
-        if (queryResult && queryResult.toString().includes(contactName)) {
-          await log(`✅ Contact "${contactName}" vérifié dans la base de contacts Android`);
-        } else {
-          await logWithLevel(`⚠️ Contact non trouvé dans la base, mais création peut avoir réussi`, 'warn');
-        }
-      } catch (verifyError: any) {
-        await logWithLevel(`⚠️ Impossible de vérifier le contact: ${verifyError.message}`, 'warn');
-      }
-      
-      // Also verify visually by opening contacts list
-      await log(`📱 Ouverture de la liste des contacts pour vérification visuelle...`);
-      await driver.execute('mobile: shell', {
-        command: 'am',
-        args: ['start', '-a', 'android.intent.action.VIEW', '-d', 'content://contacts/people'],
-      });
-      
-      await this.sleep(2000);
-      await this.saveScreenshot(driver, 'android-contacts-list-final', sessionId, log);
-      await this.logCurrentScreen(driver, sessionId, log);
-      
-      await log(`✅ Contact Android créé avec succès !`);
-      
-    } catch (error: any) {
-      await logWithLevel(`❌ Échec de la création du contact: ${error.message}`, 'error');
-      logger.error({ error: error.message, sessionId, contactName }, 'Failed to create Android contact');
-      throw error;
-    } finally {
-      if (driver) {
-        try {
-          await driver.deleteSession();
-          await log(`🔌 Session Appium fermée`);
-        } catch (e) {
-          // Ignore cleanup errors
-        }
-      }
-    }
-  }
-
-  /**
-   * Send WhatsApp message by selecting contact from list
-   */
-  async sendMessageViaContact(options: {
-    appiumPort: number;
-    sessionId: string;
-    contactName: string;
-    phoneNumber: string;
-    message: string;
-  }): Promise<void> {
-    const { appiumPort, sessionId, contactName, phoneNumber, message } = options;
-    
-    const log = (msg: string) => {
-      logger.info(msg);
-      console.log(`💬 [WHATSAPP-CONTACT] ${msg}`);
-      
-      // Save log to database
-      (async () => {
-        try {
-          const { sessionService } = await import('./session.service');
-          await sessionService.createLog({
-            sessionId: sessionId,
-            level: 'info',
-            message: msg,
-            source: 'whatsapp-contact',
-          });
-        } catch (e) {
-          // Ignore
-        }
-      })();
-    };
-    
-    log(`📤 Envoi de message WhatsApp via liste de contacts`);
-    log(`👤 Contact: ${contactName}`);
-    log(`📞 Numéro: ${phoneNumber}`);
-    log(`💬 Message: ${message}`);
-    
-    let driver: any = null;
-    
-    try {
-      // Connect to Appium
-      log(`🔌 Connexion à Appium sur host.docker.internal:${appiumPort}...`);
-      await this.waitForAppium(appiumPort, 30000, log);
-      
-      driver = await remote({
-        hostname: 'host.docker.internal',
-        port: appiumPort,
-        path: '/',
-        capabilities: {
-          platformName: 'Android',
-          'appium:automationName': 'UiAutomator2',
-          'appium:deviceName': 'Android Emulator',
-          'appium:noReset': true,
-        },
-        logLevel: 'error',
-      });
-      
-      log(`✅ Connecté à Appium`);
-      
-      // Open WhatsApp home
-      log(`📱 Ouverture de WhatsApp...`);
-      await driver.execute('mobile: startActivity', {
-        action: 'android.intent.action.MAIN',
-        package: 'com.whatsapp',
-        activity: '.HomeActivity',
-      });
-      
-      await this.sleep(3000);
-      await this.saveScreenshot(driver, 'whatsapp-home', sessionId, log);
-      await this.logCurrentScreen(driver, sessionId, log);
-      
-      // Navigate to Contacts tab in WhatsApp
-      log(`📇 Navigation vers l'onglet Contacts de WhatsApp...`);
-      
-      const contactsTabSelectors = [
-        '//*[@text="Contacts"]',
-        '//*[@content-desc="Contacts"]',
-        '//*[contains(@text, "Contact")]',
-        '//*[contains(@content-desc, "Contact")]',
-      ];
-      
-      let contactsTabFound = false;
-      for (const selector of contactsTabSelectors) {
-        try {
-          const contactsTab = await driver.$(selector);
-          const exists = await contactsTab.isExisting();
-          if (exists) {
-            const isDisplayed = await contactsTab.isDisplayed().catch(() => false);
-            if (isDisplayed) {
-              log(`✅ Onglet Contacts trouvé avec: ${selector}`);
-              await contactsTab.click();
-              contactsTabFound = true;
-              await this.sleep(2000);
-              await this.saveScreenshot(driver, 'whatsapp-contacts-tab', sessionId, log);
-              await this.logCurrentScreen(driver, sessionId, log);
-              break;
-            }
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-      
-      if (!contactsTabFound) {
-        log(`⚠️ Onglet Contacts non trouvé, tentative d'accès via le bouton menu...`);
-        
-        // Try accessing contacts via menu button
-        const menuSelectors = [
-          '//*[@content-desc="More options"]',
-          '//*[@resource-id="com.whatsapp:id/menuitem_more"]',
-          '//android.widget.ImageButton[@content-desc="More options"]',
-        ];
-        
-        for (const selector of menuSelectors) {
-          try {
-            const menuButton = await driver.$(selector);
-            const exists = await menuButton.isExisting();
-            if (exists) {
-              log(`✅ Bouton menu trouvé, clic...`);
-              await menuButton.click();
-              await this.sleep(1000);
-              
-              // Look for "Contacts" in menu
-              const contactsMenuItems = [
-                '//*[@text="Contacts"]',
-                '//*[@text="Select contacts"]',
-              ];
-              
-              for (const itemSelector of contactsMenuItems) {
-                try {
-                  const contactsMenuItem = await driver.$(itemSelector);
-                  const itemExists = await contactsMenuItem.isExisting();
-                  if (itemExists) {
-                    log(`✅ Item menu "Contacts" trouvé, clic...`);
-                    await contactsMenuItem.click();
-                    await this.sleep(2000);
-                    await this.saveScreenshot(driver, 'whatsapp-contacts-menu', sessionId, log);
-                    await this.logCurrentScreen(driver, sessionId, log);
-                    contactsTabFound = true;
-                    break;
-                  }
-                } catch (e2) {
-                  continue;
-                }
-              }
-              
-              if (contactsTabFound) break;
-            }
-          } catch (e) {
-            continue;
-          }
-        }
-      }
-      
-      if (!contactsTabFound) {
-        log(`⚠️ Impossible d'accéder aux contacts, tentative de recherche directe...`);
-        // Fallback: try to search directly from home screen
-      }
-      
-      await this.sleep(1000);
-      
-      // Search for the contact by name
-      log(`🔍 Recherche du contact "${contactName}" dans la liste...`);
-      
-      const contactListSelectors = [
-        `//*[@text="${contactName}"]`,
-        `//*[contains(@text, "${contactName}")]`,
-      ];
-      
-      let contactFound = false;
-      for (const selector of contactListSelectors) {
-        try {
-          const contactElement = await driver.$(selector);
-          const exists = await contactElement.isExisting();
-          if (exists) {
-            const isDisplayed = await contactElement.isDisplayed().catch(() => false);
-            if (isDisplayed) {
-              log(`✅ Contact "${contactName}" trouvé dans la liste !`);
-              await contactElement.click();
-              log(`✅ Contact cliqué`);
-              contactFound = true;
-              await this.sleep(2000);
-              await this.saveScreenshot(driver, 'whatsapp-contact-selected', sessionId, log);
-              await this.logCurrentScreen(driver, sessionId, log);
-              break;
-            }
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-      
-      if (!contactFound) {
-        log(`⚠️ Contact "${contactName}" non trouvé dans la liste, tentative de recherche...`);
-        
-        // Use search functionality
-        const searchSelectors = [
-          '//*[@resource-id="com.whatsapp:id/search_src_text"]',
-          '//*[@resource-id="com.whatsapp:id/menuitem_search"]',
-          '//*[@content-desc="Search"]',
-          '//android.widget.EditText',
-        ];
-        
-        for (const selector of searchSelectors) {
-          try {
-            const searchField = await driver.$(selector);
-            const exists = await searchField.isExisting();
-            if (exists) {
-              log(`✅ Champ de recherche trouvé`);
-              await searchField.click();
-              await this.sleep(1000);
-              await searchField.setValue(contactName);
-              log(`✅ Nom "${contactName}" saisi dans la recherche`);
-              await this.sleep(2000);
-              await this.saveScreenshot(driver, 'whatsapp-search-results', sessionId, log);
-              
-              // Click on the first result
-              const resultSelectors = [
-                `//*[@text="${contactName}"]`,
-                `//*[contains(@text, "${contactName}")]`,
-                '(//android.widget.TextView)[1]',
-              ];
-              
-              for (const resultSelector of resultSelectors) {
-                try {
-                  const result = await driver.$(resultSelector);
-                  const resultExists = await result.isExisting();
-                  if (resultExists) {
-                    log(`✅ Résultat de recherche trouvé, clic...`);
-                    await result.click();
-                    contactFound = true;
-                    await this.sleep(2000);
-                    break;
-                  }
-                } catch (e2) {
-                  continue;
-                }
-              }
-              
-              if (contactFound) break;
-            }
-          } catch (e) {
-            continue;
-          }
-        }
-      }
-      
-      if (!contactFound) {
-        throw new Error(`Contact "${contactName}" not found in WhatsApp contacts`);
-      }
-      
-      // Now we should be in the chat with the contact
-      await this.saveScreenshot(driver, 'whatsapp-chat-opened', sessionId, log);
-      log(`📸 Screenshot de la conversation ouverte`);
-      await this.logCurrentScreen(driver, sessionId, log);
-      
-      // Type message
-      log(`⌨️ Saisie du message...`);
-      
-      const messageInputSelectors = [
-        '//*[@resource-id="com.whatsapp:id/entry"]',
-        '//android.widget.EditText[@content-desc="Message"]',
-        '//android.widget.EditText',
-      ];
-      
-      for (const selector of messageInputSelectors) {
-        try {
-          const messageInput = await driver.$(selector);
-          const exists = await messageInput.isExisting();
-          if (exists) {
-            log(`✅ Champ de message trouvé`);
-            await messageInput.click();
-            await this.sleep(500);
-            await messageInput.setValue(message);
-            log(`✅ Message saisi: "${message}"`);
-            await this.sleep(1000);
-            break;
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-      
-      await this.saveScreenshot(driver, 'whatsapp-message-typed', sessionId, log);
-      log(`📸 Screenshot du message saisi`);
-      
-      // Click send button
-      log(`📤 Recherche du bouton d'envoi...`);
-      
-      const sendButtonSelectors = [
-        '//*[@resource-id="com.whatsapp:id/send"]',
-        '//*[@content-desc="Send"]',
-        '//android.widget.ImageButton[@content-desc="Send"]',
-      ];
-      
-      for (const selector of sendButtonSelectors) {
-        try {
-          const sendButton = await driver.$(selector);
-          const exists = await sendButton.isExisting();
-          if (exists) {
-            log(`✅ Bouton d'envoi trouvé, clic...`);
-            await sendButton.click();
-            await this.sleep(2000);
-            log(`✅ Message envoyé avec succès !`);
-            break;
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-      
-      await this.saveScreenshot(driver, 'whatsapp-message-sent', sessionId, log);
-      log(`📸 Screenshot du message envoyé`);
-      
-      log(`✅ Message WhatsApp envoyé via contact avec succès !`);
-      
-    } catch (error: any) {
-      log(`❌ Échec de l'envoi du message: ${error.message}`);
-      logger.error({ error: error.message, sessionId, contactName }, 'Failed to send message via contact');
-      throw error;
-    } finally {
-      if (driver) {
-        log(`ℹ️ Session Appium maintenue active`);
       }
     }
   }

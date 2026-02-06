@@ -1,12 +1,15 @@
 import { useEffect } from 'react';
 import { io, Socket } from 'socket.io-client';
 
-const SOCKET_URL = (import.meta as any).env?.VITE_SOCKET_URL || 'http://localhost:3000';
+// Use window.location.origin to connect to the same server (nginx proxies to API)
+const SOCKET_URL = (import.meta as any).env?.VITE_SOCKET_URL || window.location.origin;
 
 interface UseSocketOptions {
   onNewMessage?: (data: any) => void;
   onSessionStatus?: (data: any) => void;
   onSessionLog?: (data: any) => void;
+  onSessionReady?: (data: any) => void;
+  onSessionCreated?: (data: any) => void;
 }
 
 let socket: Socket | null = null;
@@ -43,6 +46,14 @@ export function useSocket(options: UseSocketOptions) {
       socket.on('session_log', options.onSessionLog);
     }
 
+    if (options.onSessionReady) {
+      socket.on('session_ready', options.onSessionReady);
+    }
+
+    if (options.onSessionCreated) {
+      socket.on('session_created', options.onSessionCreated);
+    }
+
     // Cleanup
     return () => {
       if (options.onNewMessage) {
@@ -54,8 +65,14 @@ export function useSocket(options: UseSocketOptions) {
       if (options.onSessionLog) {
         socket?.off('session_log', options.onSessionLog);
       }
+      if (options.onSessionReady) {
+        socket?.off('session_ready', options.onSessionReady);
+      }
+      if (options.onSessionCreated) {
+        socket?.off('session_created', options.onSessionCreated);
+      }
     };
-  }, [options.onNewMessage, options.onSessionStatus, options.onSessionLog]);
+  }, [options.onNewMessage, options.onSessionStatus, options.onSessionLog, options.onSessionReady, options.onSessionCreated]);
 
   return socket;
 }

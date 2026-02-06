@@ -87,19 +87,6 @@ async function getUnitedStatesCountryId(): Promise<string> {
 }
 
 /**
- * Get Canada country ID from SMS-MAN
- */
-async function getCanadaCountryId(): Promise<string> {
-  try {
-    return await smsManAdapter.getCountryId('Canada');
-  } catch (error: any) {
-    logger.error({ error: error.message }, 'Failed to get Canada country ID from SMS-MAN');
-    // Use default fallback - SMS-MAN Canada is typically country ID "36"
-    return '36';
-  }
-}
-
-/**
  * Determine provider and country ID - simplified logic
  */
 async function determineProviderAndCountryId(countryId?: string): Promise<{ 
@@ -172,7 +159,27 @@ async function determineProviderAndCountryId(countryId?: string): Promise<{
   for (const countryName of countryCascade) {
     logger.info({ country: countryName }, `🔍 Trying ${countryName}...`);
     
-    // Try OnlineSim FIRST for this country (better SMS reception rate)
+    // Try SMS-MAN first for this country
+    try {
+      const smsManCountryId = await smsManAdapter.getCountryId(countryName);
+      
+      // Check if numbers are available
+      const prices = await smsManAdapter.getPrices(
+        smsManCountryId,
+        await smsManAdapter.getWhatsAppApplicationId()
+      );
+      
+      if (prices && prices.count > 0) {
+        logger.info({ country: countryName, countryId: smsManCountryId, count: prices.count }, `✅ ${countryName} available on SMS-MAN (${prices.count} numbers)`);
+        return { provider: 'SMS-MAN', countryId: smsManCountryId, countryName };
+      } else {
+        logger.info({ country: countryName }, `⚠️ ${countryName} - no numbers on SMS-MAN, trying OnlineSim...`);
+      }
+    } catch (smsManError: any) {
+      logger.warn({ country: countryName, error: smsManError.message }, `⚠️ SMS-MAN error for ${countryName}`);
+    }
+    
+    // Try OnlineSim if SMS-MAN failed or no numbers
     if (onlineSimAvailable) {
       try {
         const onlineSimCountryId = await onlineSimAdapter.getCountryId(countryName);
@@ -187,7 +194,7 @@ async function determineProviderAndCountryId(countryId?: string): Promise<{
           logger.info({ country: countryName, countryId: onlineSimCountryId, count: whatsappService.count }, `✅ ${countryName} available on OnlineSim (${whatsappService.count} numbers)`);
           return { provider: 'ONLINESIM', countryId: onlineSimCountryId.toString(), countryName };
         } else {
-          logger.info({ country: countryName }, `⚠️ ${countryName} - no numbers on OnlineSim, trying SMS-MAN...`);
+          logger.info({ country: countryName }, `⚠️ ${countryName} - no numbers on OnlineSim`);
         }
       } catch (onlineSimError: any) {
         const isTryAgain = onlineSimError.message?.includes('TRY_AGAIN_LATER');
@@ -197,26 +204,6 @@ async function determineProviderAndCountryId(countryId?: string): Promise<{
           logger.warn({ country: countryName, error: onlineSimError.message }, `⚠️ OnlineSim error for ${countryName}`);
         }
       }
-    }
-    
-    // Try SMS-MAN as fallback if OnlineSim failed or no numbers
-    try {
-      const smsManCountryId = await smsManAdapter.getCountryId(countryName);
-      
-      // Check if numbers are available
-      const prices = await smsManAdapter.getPrices(
-        smsManCountryId,
-        await smsManAdapter.getWhatsAppApplicationId()
-      );
-      
-      if (prices && prices.count > 0) {
-        logger.info({ country: countryName, countryId: smsManCountryId, count: prices.count }, `✅ ${countryName} available on SMS-MAN (${prices.count} numbers)`);
-        return { provider: 'SMS-MAN', countryId: smsManCountryId, countryName };
-      } else {
-        logger.info({ country: countryName }, `⚠️ ${countryName} - no numbers on SMS-MAN`);
-      }
-    } catch (smsManError: any) {
-      logger.warn({ country: countryName, error: smsManError.message }, `⚠️ SMS-MAN error for ${countryName}`);
     }
     
     logger.warn({ country: countryName }, `❌ ${countryName} - no numbers available on any provider, trying next country...`);
@@ -230,9 +217,6 @@ async function processProvision(job: Job<ProvisionJobData>) {
   const { provisionId, countryId, applicationId, linkToWeb } = job.data;
   
   logger.info({ provisionId, jobId: job.id }, 'Processing provision job');
-
-  // Declare session outside try-catch so it's accessible in catch block
-  let session: any = null;
 
   try {
     // Step 0: Cleanup expired TZIDs before starting
@@ -257,6 +241,8 @@ async function processProvision(job: Job<ProvisionJobData>) {
       where: { provisionId },
       orderBy: { createdAt: 'desc' },
     });
+    
+    let session;
     
     if (existingSessions.length > 0) {
       logger.error({ 
@@ -299,34 +285,31 @@ async function processProvision(job: Job<ProvisionJobData>) {
       agentToken,
     });
     
-    await saveLog(session.id, 'info', '📦 Conteneur Docker créé avec succès', 'provision');
-    await saveLog(session.id, 'info', `🖥️ Session ID: ${session.id}`, 'provision');
-    await saveLog(session.id, 'info', '🤖 Démarrage d\'Android dans l\'émulateur...', 'provision');
+    // Broadcast session created event immediately so frontend can show it
+    await broadcastEvent('session_created', {
+      sessionId: session.id,
+      provisionId,
+      containerId: emulatorInfo.containerId,
+      streamUrl: emulatorInfo.streamUrl,
+      vncPort: emulatorInfo.vncPort,
+      appiumPort: emulatorInfo.appiumPort,
+      isActive: false,
+      linkedWeb: false,
+      phone: null,
+      state: ProvisionState.SPAWNING_CONTAINER,
+      createdAt: session.createdAt,
+    });
     
+    await saveLog(session.id, 'info', '📦 Conteneur créé, préparation au lancement de WhatsApp...', 'provision');
     await broadcastEvent('provision_update', {
       provisionId,
       sessionId: session.id,
       state: ProvisionState.SPAWNING_CONTAINER,
       progress: 15,
-      message: `🤖 Android est en train de démarrer...`
+      message: `Conteneur créé, lancement de WhatsApp...`
     });
     
-    // Wait a bit for Android to boot
-    await new Promise(resolve => setTimeout(resolve, 3000));
-    await saveLog(session.id, 'info', '✅ Android a démarré avec succès', 'provision');
-    await saveLog(session.id, 'info', '📱 Système Android opérationnel', 'provision');
-    
-    await broadcastEvent('provision_update', {
-      provisionId,
-      sessionId: session.id,
-      state: ProvisionState.SPAWNING_CONTAINER,
-      progress: 20,
-      message: `✅ Android opérationnel`
-    });
-    
-    await job.updateProgress(20);
-    
-    await saveLog(session.id, 'info', '🔧 Préparation du système...', 'provision');
+    await job.updateProgress(18);
     
     // Step 2: Determine provider and country ID (but don't buy yet!)
     let provider: 'ONLINESIM' | 'SMS-MAN';
@@ -354,14 +337,12 @@ async function processProvision(job: Job<ProvisionJobData>) {
     
     logger.info({ provider, countryId: finalCountryId, countryName: countryNameForOnlineSim }, 'Provider and country determined (will buy when WhatsApp is ready)');
     
-    await saveLog(session.id, 'info', '📱 Préparation du lancement de WhatsApp...', 'provision');
-    
     await broadcastEvent('provision_update', {
       provisionId,
       sessionId: session.id,
       state: ProvisionState.LAUNCHING_WHATSAPP,
-      progress: 25,
-      message: `📱 Préparation de WhatsApp...`
+      progress: 20,
+      message: `🚀 Lancement de WhatsApp (numéro sera acheté quand prêt)...`
     });
     
     // Step 3: Define callback to buy number ONLY when WhatsApp shows phone entry screen
@@ -424,25 +405,15 @@ async function processProvision(job: Job<ProvisionJobData>) {
           
           if (isSkipSignal || isTryAgain) {
             logger.warn({ error: error.message }, 'OnlineSim unavailable, falling back to SMS-MAN');
-            await saveLog(session.id, 'warn', `⚠️ OnlineSim indisponible, fallback vers SMS-MAN...`, 'provision');
           } else {
             logger.error({ error: error.message }, 'OnlineSim purchase failed, falling back to SMS-MAN');
-            await saveLog(session.id, 'error', `❌ OnlineSim échoué : ${error.message}`, 'provision');
-            await saveLog(session.id, 'warn', `⚠️ Fallback vers SMS-MAN...`, 'provision');
           }
           
-          try {
             const smsManCountryId = await getUnitedStatesCountryId();
-            logger.info({ smsManCountryId }, 'Attempting SMS-MAN purchase as fallback...');
-            await saveLog(session.id, 'info', `📞 Tentative d'achat SMS-MAN en fallback (US)...`, 'provision');
-            
             buyResult = await smsManAdapter.buyNumber(
               smsManCountryId,
               applicationId || await smsManAdapter.getWhatsAppApplicationId()
             );
-            
-            logger.info({ number: buyResult.number }, '✅ SMS-MAN fallback successful');
-            await saveLog(session.id, 'info', `✅ Fallback SMS-MAN réussi : ${buyResult.number}`, 'provision');
             
             try {
               phoneNumberId = await phoneNumberService.savePhoneNumber({
@@ -452,143 +423,74 @@ async function processProvision(job: Job<ProvisionJobData>) {
                 countryId: smsManCountryId,
               });
             } catch (saveError: any) {
-              // Ignore duplicate errors
-            }
-          } catch (smsManFallbackError: any) {
-            logger.error({ 
-              onlineSimError: error.message,
-              smsManFallbackError: smsManFallbackError.message 
-            }, '❌ Both providers failed: OnlineSim and SMS-MAN fallback');
-            await saveLog(session.id, 'error', `❌ Les deux fournisseurs ont échoué`, 'provision');
-            await saveLog(session.id, 'error', `  ├─ OnlineSim : ${error.message}`, 'provision');
-            await saveLog(session.id, 'error', `  └─ SMS-MAN fallback : ${smsManFallbackError.message}`, 'provision');
-            throw new Error(`All providers exhausted. OnlineSim: ${error.message} | SMS-MAN fallback: ${smsManFallbackError.message}`);
+            // Ignore
           }
         }
       } else {
-        // SMS-MAN (primary for direct purchase) - Try USA first, then Canada, then OnlineSim
-        const smsManCountries = [
-          { id: await getUnitedStatesCountryId(), name: 'USA' },
-          { id: await getCanadaCountryId(), name: 'Canada' }
-        ];
-        
-        let smsManSuccess = false;
-        let lastSmsManError: Error | null = null;
-        
-        for (const country of smsManCountries) {
-          logger.info({ provider: 'SMS-MAN', countryId: country.id, countryName: country.name }, `🔄 Attempting to purchase number from SMS-MAN (${country.name})...`);
-          await saveLog(session.id, 'info', `📞 Tentative SMS-MAN (${country.name})...`, 'provision');
+        // SMS-MAN (primary for direct purchase)
+        logger.info({ provider: 'SMS-MAN', countryId: finalCountryId }, '🔄 Attempting to purchase number from SMS-MAN...');
+        await saveLog(session.id, 'info', `📞 Attempting SMS-MAN purchase (country: ${finalCountryId})...`, 'provision');
           
           try {
             buyResult = await smsManAdapter.buyNumber(
-              country.id,
+            finalCountryId,
               applicationId || await smsManAdapter.getWhatsAppApplicationId()
             );
             
-            logger.info({ number: buyResult.number, requestId: buyResult.request_id, country: country.name }, `✅ Achat SMS-MAN réussi (${country.name})`);
-            await saveLog(session.id, 'info', `✅ Achat SMS-MAN réussi (${country.name}) : ${buyResult.number}`, 'provision');
+          logger.info({ number: buyResult.number, requestId: buyResult.request_id }, '✅ Achat SMS-MAN réussi');
+          await saveLog(session.id, 'info', `✅ Achat SMS-MAN réussi : ${buyResult.number}`, 'provision');
             
             try {
               phoneNumberId = await phoneNumberService.savePhoneNumber({
                 phone: buyResult.number,
                 requestId: buyResult.request_id,
                 provider: 'SMS-MAN',
-                countryId: country.id,
+              countryId: finalCountryId,
               });
             } catch (saveError: any) {
               // Ignore duplicate errors
             }
-            
-            smsManSuccess = true;
-            break; // Success! Exit the loop
           } catch (error: any) {
-            lastSmsManError = error;
-            logger.warn({ 
-              error: error.message,
-              provider: 'SMS-MAN',
-              country: country.name,
-              countryId: country.id
-            }, `⚠️ SMS-MAN (${country.name}) échoué, tentative avec le pays suivant...`);
-            await saveLog(session.id, 'warn', `⚠️ SMS-MAN (${country.name}) échoué : ${error.message}`, 'provision');
-            // Continue to next country
-          }
-        }
-        
-        if (!smsManSuccess) {
           logger.error({ 
-            error: lastSmsManError?.message,
-            errorStack: lastSmsManError?.stack,
-            provider: 'SMS-MAN'
-          }, '❌ SMS-MAN purchase failed for all countries (USA + Canada), falling back to OnlineSim');
-          await saveLog(session.id, 'error', `❌ SMS-MAN a échoué pour tous les pays (USA + Canada)`, 'provision');
+              error: error.message,
+            errorStack: error.stack,
+              provider: 'SMS-MAN',
+            countryId: finalCountryId 
+          }, '❌ SMS-MAN purchase failed, falling back to OnlineSim');
+          await saveLog(session.id, 'error', `❌ SMS-MAN a échoué : ${error.message}`, 'provision');
           await saveLog(session.id, 'warn', `⚠️ Basculement vers OnlineSim...`, 'provision');
           
           // Fallback to OnlineSim
           try {
-            logger.info({ fallbackReason: lastSmsManError?.message }, '🔄 Starting OnlineSim fallback...');
+            logger.info({ fallbackReason: error.message }, '🔄 Starting OnlineSim fallback...');
             await saveLog(session.id, 'info', `🔄 Tentative avec OnlineSim en secours...`, 'provision');
             
-            let onlineSimCountryId: number;
-            let targetCountry: string;
-            let serviceId: string;
+            const targetCountry = countryNameForOnlineSim || 'United States';
+            logger.info({ targetCountry }, 'Looking up OnlineSim country ID...');
             
-            // Strategy 1: Try specified country if available
-            if (countryNameForOnlineSim) {
-              try {
-                targetCountry = countryNameForOnlineSim;
-                logger.info({ targetCountry }, '📍 Strategy 1: Trying specified country...');
-                await saveLog(session.id, 'info', `📍 Tentative avec ${targetCountry}...`, 'provision');
-                
-                onlineSimCountryId = await onlineSimAdapter.getCountryId(countryNameForOnlineSim);
-                logger.info({ onlineSimCountryId, targetCountry }, 'Country ID resolved');
-                
-                serviceId = await onlineSimAdapter.getWhatsAppServiceId(onlineSimCountryId);
-                logger.info({ serviceId, onlineSimCountryId }, '✅ Strategy 1 successful');
-                await saveLog(session.id, 'info', `✅ ${targetCountry} disponible (ID: ${onlineSimCountryId})`, 'provision');
-              } catch (strategy1Error: any) {
-                logger.warn({ error: strategy1Error.message, country: countryNameForOnlineSim }, '⚠️ Strategy 1 failed, trying Strategy 2...');
-                await saveLog(session.id, 'warn', `⚠️ ${countryNameForOnlineSim} échoué: ${strategy1Error.message}`, 'provision');
-                
-                // Strategy 2: Use findAvailableCountry to automatically find a working country
-                logger.info({}, '🔍 Strategy 2: Finding any available country with WhatsApp numbers...');
-                await saveLog(session.id, 'info', `🔍 Recherche automatique d'un pays disponible...`, 'provision');
-                
-                try {
-                  const availableCountry = await onlineSimAdapter.findAvailableCountry();
-                  onlineSimCountryId = availableCountry.countryId;
-                  targetCountry = availableCountry.countryName;
-                  
-                  logger.info({ onlineSimCountryId, targetCountry }, '✅ Found available country');
-                  await saveLog(session.id, 'info', `✅ Pays trouvé: ${targetCountry} (ID: ${onlineSimCountryId})`, 'provision');
-                  
+            const onlineSimCountryId = countryNameForOnlineSim 
+              ? await onlineSimAdapter.getCountryId(countryNameForOnlineSim)
+              : await onlineSimAdapter.getCountryId('United States'); // Default to US
+            
+            logger.info({ onlineSimCountryId, targetCountry }, 'OnlineSim country ID resolved');
+            await saveLog(session.id, 'info', `📍 OnlineSim country: ${targetCountry} (ID: ${onlineSimCountryId})`, 'provision');
+            
+            let serviceId: string;
+            try {
+              logger.info({ onlineSimCountryId }, 'Getting WhatsApp service ID from OnlineSim...');
                   serviceId = await onlineSimAdapter.getWhatsAppServiceId(onlineSimCountryId);
-                  logger.info({ serviceId, onlineSimCountryId }, '✅ Strategy 2 successful');
-                } catch (strategy2Error: any) {
-                  const isTryAgain = strategy2Error.message?.includes('TRY_AGAIN_LATER');
+              logger.info({ serviceId, onlineSimCountryId }, 'WhatsApp service ID resolved');
+            } catch (getServiceIdError: any) {
+              const isTryAgain = getServiceIdError.message?.includes('TRY_AGAIN_LATER');
                   if (isTryAgain) {
-                    logger.error({ error: strategy2Error.message }, '❌ OnlineSim API rate-limited (TRY_AGAIN_LATER)');
-                    await saveLog(session.id, 'error', `❌ OnlineSim API temporairement indisponible (rate limit)`, 'provision');
-                    await saveLog(session.id, 'error', `  ├─ SMS-MAN (USA + Canada) : ${lastSmsManError?.message}`, 'provision');
-                    await saveLog(session.id, 'error', `  └─ OnlineSim : ${strategy2Error.message}`, 'provision');
-                    const detailedError = `SMS-MAN: ${lastSmsManError?.message} | OnlineSim: ${strategy2Error.message}`;
+                logger.error({ error: getServiceIdError.message }, 'OnlineSim returned TRY_AGAIN_LATER (rate-limited or no numbers)');
+                await saveLog(session.id, 'error', `❌ OnlineSim: ${getServiceIdError.message}`, 'provision');
+                const detailedError = `SMS-MAN: ${error.message} | OnlineSim: ${getServiceIdError.message}`;
                     throw new Error(`All providers exhausted. ${detailedError}`);
                   }
-                  throw strategy2Error;
-                }
-              }
-            } else {
-              // No country name provided, use Strategy 2 directly
-              logger.info({}, '🔍 No country specified, using findAvailableCountry...');
-              await saveLog(session.id, 'info', `🔍 Recherche d'un pays disponible...`, 'provision');
-              
-              const availableCountry = await onlineSimAdapter.findAvailableCountry();
-              onlineSimCountryId = availableCountry.countryId;
-              targetCountry = availableCountry.countryName;
-              
-              logger.info({ onlineSimCountryId, targetCountry }, '✅ Found available country');
-              await saveLog(session.id, 'info', `✅ Pays trouvé: ${targetCountry} (ID: ${onlineSimCountryId})`, 'provision');
-              
-              serviceId = await onlineSimAdapter.getWhatsAppServiceId(onlineSimCountryId);
+              logger.error({ error: getServiceIdError.message }, 'Failed to get OnlineSim service ID');
+              await saveLog(session.id, 'error', `❌ OnlineSim service lookup failed: ${getServiceIdError.message}`, 'provision');
+              throw getServiceIdError;
             }
             
             logger.info({ onlineSimCountryId, serviceId }, 'Purchasing number from OnlineSim...');
@@ -603,7 +505,6 @@ async function processProvision(job: Job<ProvisionJobData>) {
             
             // Update provider to OnlineSim since we're using it
             provider = 'ONLINESIM';
-            countryNameForOnlineSim = targetCountry; // Update country name for later use
             
             try {
               phoneNumberId = await phoneNumberService.savePhoneNumber({
@@ -616,18 +517,18 @@ async function processProvision(job: Job<ProvisionJobData>) {
               // Ignore duplicate errors
             }
             
-            logger.info({ provider: 'ONLINESIM', number: buyResult.number, tzid: buyResult.request_id, country: targetCountry }, '✅ Successfully purchased number from OnlineSim fallback');
-            await saveLog(session.id, 'info', `✅ Secours OnlineSim réussi : ${buyResult.number} (${targetCountry})`, 'provision');
+            logger.info({ provider: 'ONLINESIM', number: buyResult.number, tzid: buyResult.request_id }, '✅ Successfully purchased number from OnlineSim fallback');
+            await saveLog(session.id, 'info', `✅ Secours OnlineSim réussi : ${buyResult.number}`, 'provision');
           } catch (onlineSimError: any) {
             logger.error({ 
-              smsManError: lastSmsManError?.message, 
+              smsManError: error.message, 
               onlineSimError: onlineSimError.message,
               onlineSimErrorStack: onlineSimError.stack
             }, '❌ All number providers exhausted');
             await saveLog(session.id, 'error', `❌ Tous les fournisseurs de numéros épuisés`, 'provision');
-            await saveLog(session.id, 'error', `  ├─ SMS-MAN (USA + Canada) : ${lastSmsManError?.message}`, 'provision');
+            await saveLog(session.id, 'error', `  ├─ SMS-MAN : ${error.message}`, 'provision');
             await saveLog(session.id, 'error', `  └─ OnlineSim : ${onlineSimError.message}`, 'provision');
-            throw new Error(`No numbers available from any provider. SMS-MAN: ${lastSmsManError?.message} | OnlineSim: ${onlineSimError.message}`);
+            throw new Error(`No numbers available from any provider. SMS-MAN: ${error.message} | OnlineSim: ${onlineSimError.message}`);
           }
         }
       }
@@ -673,30 +574,15 @@ async function processProvision(job: Job<ProvisionJobData>) {
         logger.info({ formattedNumber: buyResult.number }, 'Added + prefix to phone number');
       }
       
-      // SMS-MAN: MUST call setStatus('ready') to receive SMS
-      if (provider === 'SMS-MAN') {
-        try {
-          logger.info({ requestId: buyResult.request_id }, 'Marking SMS-MAN number as ready to receive SMS...');
-          await saveLog(session.id, 'info', `📲 Calling setStatus('ready') for ${buyResult.request_id}...`, 'sms');
-          await smsManAdapter.setStatus(buyResult.request_id, 'ready');
-          logger.info({ requestId: buyResult.request_id }, 'SMS-MAN number marked as ready');
-          await saveLog(session.id, 'info', '✅ SMS-MAN setStatus(ready) SUCCESS - number is ready to receive SMS', 'sms');
-        } catch (error: any) {
-          logger.error({ error: error.message, requestId: buyResult.request_id }, 'FAILED to mark SMS as ready!');
-          await saveLog(session.id, 'error', `❌ setStatus FAILED: ${error.message}`, 'sms');
-          // This is critical - if setStatus fails, SMS will NOT be received
-        }
-      }
-      
       // Broadcast number purchase
-      const countryInfo = countryNameForOnlineSim ? ` (${countryNameForOnlineSim})` : '';
-      await saveLog(session.id, 'info', `✅ Numéro acheté: ${buyResult.number}${countryInfo}`, 'provision');
+      const countryInfo = countryNameForOnlineSim ? ` (Country: ${countryNameForOnlineSim})` : '';
+      await saveLog(session.id, 'info', `✅ Number purchased: ${buyResult.number}${countryInfo}`, 'provision');
       await broadcastEvent('provision_update', {
         provisionId,
         sessionId: session.id,
-        state: ProvisionState.ENTERING_PHONE,
+        state: ProvisionState.BUYING_NUMBER,
         progress: 55,
-        message: `✅ Numéro acheté: ${buyResult.number}${countryInfo}`
+        message: `✅ Number purchased: ${buyResult.number}${countryInfo}`
       });
       
       return buyResult;
@@ -704,28 +590,24 @@ async function processProvision(job: Job<ProvisionJobData>) {
     
     await job.updateProgress(45);
     
-    // Step 3: Start WhatsApp automation with buy callback (contact creation removed - will be done after WhatsApp is ready)
+    // Step 4: Start WhatsApp automation with buy callback
     await provisionService.updateProvisionState(provisionId, ProvisionState.LAUNCHING_WHATSAPP);
-    await saveLog(session.id, 'info', '🤖 Connexion à Appium pour contrôler l\'émulateur...', 'automation');
+    await saveLog(session.id, 'info', '🚀 Starting WhatsApp automation...', 'automation');
     await broadcastEvent('provision_update', {
       provisionId,
       sessionId: session.id,
       state: ProvisionState.LAUNCHING_WHATSAPP,
       progress: 50,
-      message: '🤖 Connexion au système d\'automatisation...'
+      message: '🚀 Launching WhatsApp...'
     });
     
-    let automationRetries = 0;
-    const MAX_AUTOMATION_RETRIES = 1; // Only retry once if phone is already registered
-    let automationSuccess = false;
-    
-    while (!automationSuccess && automationRetries <= MAX_AUTOMATION_RETRIES) {
     try {
       await whatsappAutomationService.automateRegistration({
         appiumPort: session.appiumPort!,
         phoneNumber: undefined, // Will be provided by buyNumberCallback
         sessionId: session.id,
         containerId: session.containerId || undefined,
+        vncPort: session.vncPort || undefined, // VNC port for clicking via VNC (bypasses anti-bot)
         countryName: countryNameForOnlineSim || undefined,
         buyNumberCallback, // Pass the callback!
         onLog: async (msg: string) => {
@@ -742,7 +624,6 @@ async function processProvision(job: Job<ProvisionJobData>) {
           });
         },
       });
-        automationSuccess = true;
       await saveLog(session.id, 'info', '✅ Phone number submitted to WhatsApp. Now waiting for SMS code...', 'automation');
       await broadcastEvent('provision_update', {
         provisionId,
@@ -751,114 +632,6 @@ async function processProvision(job: Job<ProvisionJobData>) {
         message: '💬 Phone number submitted, waiting for SMS code...'
       });
     } catch (error: any) {
-        // Check if it's a "phone already registered" error
-        if (error.message && error.message.startsWith('PHONE_ALREADY_REGISTERED:') && automationRetries < MAX_AUTOMATION_RETRIES) {
-          automationRetries++;
-          const registeredPhone = error.message.split(':')[1];
-          logger.warn({ registeredPhone, provisionId, retry: automationRetries }, 'Phone already registered on another device, resetting WhatsApp in same container...');
-          await saveLog(session.id, 'warn', `⚠️ Numéro ${registeredPhone} déjà enregistré sur un autre appareil`, 'automation');
-          await saveLog(session.id, 'info', `🔄 Réinitialisation de WhatsApp dans le même container (tentative ${automationRetries}/${MAX_AUTOMATION_RETRIES})...`, 'automation');
-          
-          await broadcastEvent('provision_update', {
-            provisionId,
-            sessionId: session.id,
-            state: ProvisionState.LAUNCHING_WHATSAPP,
-            progress: 40,
-            message: `🔄 Réinitialisation de WhatsApp (numéro déjà utilisé)...`
-          });
-          
-          // Reset WhatsApp in the same container
-          try {
-            const containerId = session.containerId;
-            if (!containerId) {
-              throw new Error('Container ID not found');
-            }
-            
-            logger.info({ containerId, sessionId: session.id }, 'Uninstalling WhatsApp from container...');
-            await saveLog(session.id, 'info', '📥 Désinstallation de WhatsApp...', 'automation');
-            
-            // Uninstall WhatsApp via ADB
-            // @ts-ignore - TODO: Fix DockerService interface
-            await dockerService.execInContainer(containerId, [
-              'adb', '-s', 'emulator-5554', 'shell', 'pm', 'uninstall', 'com.whatsapp'
-            ]);
-            
-            await saveLog(session.id, 'info', '✅ WhatsApp désinstallé', 'automation');
-            logger.info({ containerId }, 'WhatsApp uninstalled, waiting 2s...');
-            await new Promise(resolve => setTimeout(resolve, 2000));
-            
-            // Clear data directory
-            logger.info({ containerId }, 'Clearing WhatsApp data...');
-            // @ts-ignore - TODO: Fix DockerService interface
-            await dockerService.execInContainer(containerId, [
-              'adb', '-s', 'emulator-5554', 'shell', 'rm', '-rf', '/data/data/com.whatsapp'
-            ]).catch(() => {
-              // Ignore if directory doesn't exist
-            });
-            
-            await saveLog(session.id, 'info', '📥 Réinstallation de WhatsApp...', 'automation');
-            logger.info({ containerId }, 'Reinstalling WhatsApp...');
-            
-            // Download and install WhatsApp again
-            // Use version from early December 2024 (working 3-5 days ago)
-            const apkUrl = 'https://www.whatsapp.com/android/2.24.24.76/WhatsApp.apk';
-            // @ts-ignore - TODO: Fix DockerService interface
-            await dockerService.execInContainer(containerId, [
-              'curl', '-L', '-o', '/tmp/whatsapp.apk', apkUrl
-            ]);
-            
-            // @ts-ignore - TODO: Fix DockerService interface
-            await dockerService.execInContainer(containerId, [
-              'adb', '-s', 'emulator-5554', 'install', '-r', '/tmp/whatsapp.apk'
-            ]);
-            
-            await saveLog(session.id, 'info', '✅ WhatsApp réinstallé avec succès', 'automation');
-            logger.info({ containerId }, 'WhatsApp reinstalled successfully');
-            await new Promise(resolve => setTimeout(resolve, 3000));
-            
-            // Reset buyResult to null so it will buy a NEW number
-            buyResult = null;
-            
-            await saveLog(session.id, 'info', '🔄 Redémarrage du processus avec un nouveau numéro...', 'automation');
-            await broadcastEvent('provision_update', {
-              provisionId,
-              sessionId: session.id,
-              state: ProvisionState.LAUNCHING_WHATSAPP,
-              progress: 45,
-              message: '🔄 Redémarrage avec un nouveau numéro...'
-            });
-            
-            // Continue the loop to retry automateRegistration
-          } catch (resetError: any) {
-            logger.error({ error: resetError, provisionId }, 'Failed to reset WhatsApp in container');
-            await saveLog(session.id, 'error', `❌ Échec de la réinitialisation: ${resetError.message}`, 'automation');
-            throw resetError;
-          }
-        } else {
-          // Check if this is a CRITICAL error (phone number not submitted)
-          if (error.message && error.message.includes('Failed to submit phone number')) {
-            // CRITICAL: Cannot proceed without submitting phone number
-            logger.error({ error: error.message, provisionId }, 'CRITICAL: Phone number was not submitted - STOPPING provisioning');
-            await saveLog(session.id, 'error', `❌ CRITICAL ERROR: ${error.message}`, 'automation');
-            await saveLog(session.id, 'error', `❌ PROVISIONING STOPPED - Cannot wait for SMS if phone was never submitted`, 'automation');
-            await broadcastEvent('provision_update', {
-              provisionId,
-              sessionId: session.id,
-              state: ProvisionState.FAILED,
-              progress: 0,
-              message: `❌ Phone number submission failed - ${error.message}`
-            });
-            
-            // Mark provision as failed
-            await prisma.provision.update({
-              where: { id: provisionId },
-              data: { state: ProvisionState.FAILED }
-            });
-            
-            throw new Error(`CRITICAL: ${error.message}`);
-          }
-          
-          // Other error or max retries reached
           logger.warn({ error: error.message, provisionId }, 'WhatsApp automation failed, continuing with SMS polling');
           await saveLog(session.id, 'warn', `WhatsApp automation failed: ${error.message}. The system will still wait for SMS.`, 'automation', { error: error.message });
           await broadcastEvent('provision_update', {
@@ -867,9 +640,6 @@ async function processProvision(job: Job<ProvisionJobData>) {
             progress: 55,
             message: `⚠️ Automation incomplete: ${error.message}. Waiting for SMS...`
           });
-          break; // Exit loop
-        }
-      }
     }
     
     await job.updateProgress(65);
@@ -895,11 +665,7 @@ async function processProvision(job: Job<ProvisionJobData>) {
       throw new Error(errorMsg);
     }
     
-    // CRITICAL: For SMS-MAN, mark number as 'ready' ONLY IF automation succeeded
-    // SMS-MAN auto-detects SMS requests, no manual status setting needed
-    logger.info({ provider, requestId: buyResult.request_id }, 'Ready to receive SMS from provider');
-    
-    // Step 4: Poll for OTP from the provider used (with 60s timeout and retry logic)
+    // Step 5: Poll for OTP from the provider used (with 60s timeout and retry logic)
     logger.info({ provisionId, requestId: buyResult.request_id, provider, phone: buyResult.number }, 'Polling for OTP');
     
     let otp: string | undefined;
@@ -912,50 +678,19 @@ async function processProvision(job: Job<ProvisionJobData>) {
         const pollStartTime = Date.now();
         const sixtySeconds = 60000;
         
-        // Broadcast at the START of each polling attempt so user knows we're actively polling
-        logger.info({ pollingAttempt, maxPollingAttempts, provider, requestId: buyResult.request_id }, `Starting SMS polling attempt ${pollingAttempt + 1}/${maxPollingAttempts}`);
-        await broadcastEvent('provision_update', {
-          provisionId,
-          sessionId: session.id,
-          state: ProvisionState.WAITING_OTP,
-          progress: 65 + (pollingAttempt * 5),
-          message: `⏳ En attente du SMS (tentative ${pollingAttempt + 1}/${maxPollingAttempts}, max 60s)...`
-        });
-        await saveLog(session.id, 'info', `⏳ Tentative ${pollingAttempt + 1}/${maxPollingAttempts} de réception SMS (timeout: 60s)...`, 'sms');
-        
         if (provider === 'ONLINESIM') {
           const tzid = Number(buyResult.request_id);
           let smsReceived = false;
           
           while (Date.now() - pollStartTime < sixtySeconds && !smsReceived) {
             try {
-              const elapsed = Math.floor((Date.now() - pollStartTime) / 1000);
-              logger.info({ tzid, elapsed }, 'Polling OnlineSim for SMS...');
-              
-              // Broadcast every 30 seconds to show progress
-              if (elapsed === 30 || elapsed === 31) {
-                await broadcastEvent('provision_update', {
-                  provisionId,
-                  sessionId: session.id,
-                  state: ProvisionState.WAITING_OTP,
-                  progress: 67 + (pollingAttempt * 5),
-                  message: `⏳ Toujours en attente du SMS... (${elapsed}s écoulées)`
-                });
-              }
-              
+              logger.info({ tzid, elapsed: Date.now() - pollStartTime }, 'Polling OnlineSim for SMS...');
               const sms = await onlineSimAdapter.getSms(tzid);
               logger.info({ tzid, sms, hasContent: !!sms }, 'OnlineSim API response');
               if (sms && sms.trim().length > 0) {
                 otp = sms;
                 smsReceived = true;
                 logger.info({ tzid, otp }, 'SMS received from OnlineSim');
-                await broadcastEvent('provision_update', {
-                  provisionId,
-                  sessionId: session.id,
-                  state: ProvisionState.WAITING_OTP,
-                  progress: 75,
-                  message: `✅ SMS reçu: ${otp}`
-                });
                 break;
               }
             } catch (error: any) {
@@ -964,7 +699,7 @@ async function processProvision(job: Job<ProvisionJobData>) {
                 throw error;
               }
             }
-            await new Promise(resolve => setTimeout(resolve, 10000)); // Check every 10 seconds
+            await new Promise(resolve => setTimeout(resolve, 3000)); // Check every 3 seconds
           }
           
           if (!smsReceived) {
@@ -977,58 +712,17 @@ async function processProvision(job: Job<ProvisionJobData>) {
           
           while (Date.now() - pollStartTime < sixtySeconds && !smsReceived) {
             try {
-              const elapsed = Math.floor((Date.now() - pollStartTime) / 1000);
-              logger.info({ requestId, elapsed }, 'Polling SMS-MAN for SMS...');
-              
-              // Broadcast every 10 seconds to show progress
-              if (elapsed % 10 === 0 && elapsed > 0) {
-                await broadcastEvent('provision_update', {
-                  provisionId,
-                  sessionId: session.id,
-                  state: ProvisionState.WAITING_OTP,
-                  progress: 67 + Math.min(elapsed / 6, 8), // Increment progress slowly
-                  message: `⏳ Vérification SMS... (${elapsed}s)`
-                });
-              }
-              
+              logger.info({ requestId, elapsed: Date.now() - pollStartTime }, 'Polling SMS-MAN for SMS...');
               const result = await smsManAdapter.getSms(requestId);
               logger.info({ requestId, result, hasSmsCode: !!result.sms_code }, 'SMS-MAN API response');
-              
-              // Log to frontend for visibility
-              if (elapsed % 10 === 0) {
-                await saveLog(session.id, 'info', `🔍 Polling SMS-MAN (${elapsed}s): ${result.error_msg || 'waiting...'}`, 'sms');
-              }
-              
               if (result.sms_code) {
                 otp = result.sms_code;
                 smsReceived = true;
                 logger.info({ requestId, otp }, 'SMS received from SMS-MAN');
-                await broadcastEvent('provision_update', {
-                  provisionId,
-                  sessionId: session.id,
-                  state: ProvisionState.WAITING_OTP,
-                  progress: 75,
-                  message: `📱 SMS reçu: ${otp}`
-                });
                 break;
-              } else {
-                // Log when no SMS yet (for debugging)
-                if (elapsed % 20 === 0 && elapsed > 0) {
-                  logger.info({ requestId, elapsed, result }, 'No SMS yet from SMS-MAN, continuing to poll...');
-                }
               }
             } catch (error: any) {
-              const elapsed = Math.floor((Date.now() - pollStartTime) / 1000);
-              logger.warn({ requestId, error: error.message, elapsed }, 'SMS-MAN polling error');
-              
-              // Broadcast error to frontend
-              await broadcastEvent('provision_update', {
-                provisionId,
-                sessionId: session.id,
-                state: ProvisionState.WAITING_OTP,
-                progress: 67,
-                message: `⚠️ Erreur SMS-MAN (${elapsed}s): ${error.message}`
-              });
+              logger.warn({ requestId, error: error.message }, 'SMS-MAN polling error');
               
               // Check if it's a critical error that should trigger fallback
               const isCriticalError = error.message?.includes('not exists') || 
@@ -1044,7 +738,7 @@ async function processProvision(job: Job<ProvisionJobData>) {
               // For other errors, continue polling (might be temporary API issue)
               logger.warn({ requestId }, 'SMS-MAN temporary error, continuing to poll...');
             }
-            await new Promise(resolve => setTimeout(resolve, 10000)); // Check every 10 seconds
+            await new Promise(resolve => setTimeout(resolve, 3000)); // Check every 3 seconds
           }
           
           if (!smsReceived) {
@@ -1113,7 +807,7 @@ async function processProvision(job: Job<ProvisionJobData>) {
 
     await job.updateProgress(80);
 
-    // Step 5: Enqueue OTP injection job AND WAIT for it to complete
+    // Step 6: Enqueue OTP injection job AND WAIT for it to complete
     await provisionService.updateProvisionState(provisionId, ProvisionState.INJECTING_OTP);
     await saveLog(session.id, 'info', `🔑 Injecting SMS code into WhatsApp: ${extractedOtp}...`, 'provision');
     await broadcastEvent('provision_update', {
@@ -1122,6 +816,15 @@ async function processProvision(job: Job<ProvisionJobData>) {
       progress: 80,
       message: `🔑 Entering SMS code: ${extractedOtp}...`
     });
+
+    // Mark SMS as ready (only for SMS-MAN, OnlineSim doesn't need this)
+    if (provider === 'SMS-MAN') {
+      try {
+        await smsManAdapter.setStatus(buyResult.request_id, 'ready');
+      } catch (error: any) {
+        logger.warn({ error: error.message, requestId: buyResult.request_id }, 'Failed to mark SMS as ready on SMS-MAN');
+      }
+    }
 
     const otpJob = await otpQueue.add('process-otp', {
       provisionId,
@@ -1134,7 +837,7 @@ async function processProvision(job: Job<ProvisionJobData>) {
 
     // WAIT for the OTP job to finish (includes OTP injection + profile setup + all screens)
     try {
-      await otpJob.waitUntilFinished(otpQueueEvents, 600000); // Wait up to 10 minutes
+      await otpJob.waitUntilFinished(otpQueueEvents, 300000); // Wait up to 5 minutes (increased from 2)
       logger.info({ provisionId, otpJobId: otpJob.id }, 'OTP job completed successfully');
       await saveLog(session.id, 'info', '✅ OTP injection and profile setup completed!', 'provision');
     } catch (otpError: any) {
@@ -1143,26 +846,29 @@ async function processProvision(job: Job<ProvisionJobData>) {
       throw new Error(`OTP injection failed: ${otpError.message}`);
     }
 
-    // Step: Mark session as ACTIVE
-    await provisionService.updateProvisionState(provisionId, ProvisionState.ACTIVE);
-    await saveLog(session.id, 'info', '✅ Session WhatsApp activée avec succès !', 'provision');
+    // Step: Final setup (after OTP injection is REALLY done)
+    await provisionService.updateProvisionState(provisionId, ProvisionState.SETTING_UP);
+    await saveLog(session.id, 'info', '⚙️ Finalizing session activation...', 'provision');
     await broadcastEvent('provision_update', {
       provisionId,
       sessionId: session.id,
-      state: ProvisionState.ACTIVE,
-      progress: 100,
-      message: '✅ Session WhatsApp activée avec succès !'
+      state: ProvisionState.SETTING_UP,
+      progress: 95,
+      message: '⚙️ Finalizing session activation...'
     });
+    
+    // Give system time to stabilize
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    await job.updateProgress(100);
     
     await broadcastEvent('session_ready', {
       provisionId,
       sessionId: session.id,
       phone: buyResult.number,
-      message: '✅ Le compte WhatsApp est prêt à l\'emploi !'
+      message: 'WhatsApp session is ready!'
     });
 
-    await job.updateProgress(100);
-    logger.info({ provisionId, sessionId: session.id }, 'Provision job completed successfully');
+    logger.info({ provisionId, sessionId: session.id }, 'Provision job completed');
 
     return { 
       success: true, 
@@ -1174,16 +880,6 @@ async function processProvision(job: Job<ProvisionJobData>) {
     
     logger.error({ error: errorMessage, provisionId }, 'Provision job failed');
     
-    // Special handling for "phone already registered" error
-    let userFriendlyMessage = 'Provision failed';
-    if (errorMessage.includes('PHONE_ALREADY_REGISTERED')) {
-      userFriendlyMessage = '❌ Ce numéro est déjà enregistré sur un autre appareil WhatsApp';
-      if (session && session.id) {
-        await saveLog(session.id, 'error', userFriendlyMessage, 'provision');
-        await saveLog(session.id, 'error', 'Le provisioning ne peut pas continuer avec ce numéro.', 'provision');
-      }
-    }
-    
     await provisionService.updateProvisionState(
       provisionId,
       ProvisionState.FAILED,
@@ -1194,7 +890,7 @@ async function processProvision(job: Job<ProvisionJobData>) {
       provisionId,
       state: ProvisionState.FAILED,
       error: errorMessage,
-      message: userFriendlyMessage
+      message: 'Provision failed'
     });
 
     throw error;

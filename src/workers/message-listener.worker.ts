@@ -44,8 +44,8 @@ export const messagePollingWorker = new Worker(
         return;
       }
       
-      // Get the contact phone number (Jean Leroy - the test contact created during provisioning)
-      const contactPhone = '+972544463186';
+      // Get the contact phone number (the test recipient)
+      const contactPhone = '+972545879642'; // Updated to match test phone number
       
       // Poll messages from WhatsApp
       const messages = await whatsappAutomationService.pollMessages({

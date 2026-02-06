@@ -132,11 +132,26 @@ async function processProvision(job: Job<OnlineSimProvisionJobData>) {
       agentToken,
     });
 
+    // Broadcast session created event immediately so frontend can show it
+    await broadcastEvent('session_created', {
+      sessionId: session.id,
+      provisionId,
+      containerId: emulatorInfo.containerId,
+      streamUrl: emulatorInfo.streamUrl,
+      vncPort: emulatorInfo.vncPort,
+      appiumPort: emulatorInfo.appiumPort,
+      isActive: false,
+      linkedWeb: false,
+      phone: buyResult.number,
+      createdAt: session.createdAt,
+    });
+
     await job.updateProgress(50);
 
     console.log(`📡 [STEP 2] Broadcasting to frontend: Container created`);
     await broadcastEvent('provision_update', {
       provisionId,
+      sessionId: session.id,
       state: ProvisionState.SPAWNING_CONTAINER,
       progress: 50,
       message: 'Container created, starting WhatsApp registration...'

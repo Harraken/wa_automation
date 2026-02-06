@@ -3,7 +3,8 @@ import { persist } from 'zustand/middleware';
 import axios from 'axios';
 import { websocketService } from '../services/websocket.service';
 
-const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:3002';
+// Use /api prefix to go through nginx proxy
+const API_URL = (import.meta as any).env?.VITE_API_URL || '/api';
 
 interface AuthState {
   token: string | null;

@@ -13,7 +13,6 @@ export interface Message {
 
 export interface Session {
   id: string;
-  provisionId: string;
   phone: string;
   state: string;
   isActive: boolean;
@@ -87,7 +86,6 @@ export const useSessionStore = create<SessionState>((set) => ({
     }
   },
 }));
-
 
 
 

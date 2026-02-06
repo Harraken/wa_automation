@@ -23,11 +23,18 @@
     "format": "prettier --write \"src/**/*.ts\"",
     "typecheck": "tsc --noEmit"
   },
-  "keywords": ["whatsapp", "automation", "provisioning", "sms-man", "appium"],
+  "keywords": [
+    "whatsapp",
+    "automation",
+    "provisioning",
+    "sms-man",
+    "appium"
+  ],
   "author": "",
   "license": "MIT",
   "dependencies": {
     "@prisma/client": "^5.7.0",
+    "@types/sharp": "^0.32.0",
     "axios": "^1.6.2",
     "bcryptjs": "^2.4.3",
     "bullmq": "^5.1.0",
@@ -42,7 +49,11 @@
     "pino-http": "^8.6.0",
     "pino-pretty": "^10.3.1",
     "prom-client": "^15.1.0",
+    "puppeteer": "^21.11.0",
+    "sharp": "^0.34.5",
     "socket.io": "^4.6.0",
+    "tesseract.js": "^7.0.0",
+    "vnc-rfb-client": "^0.2.0",
     "webdriverio": "^8.24.0",
     "zod": "^3.22.4"
   },
@@ -74,5 +85,3 @@
     "seed": "ts-node ./prisma/seed.ts"
   }
 }
-
-

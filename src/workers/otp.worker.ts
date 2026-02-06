@@ -1,31 +1,18 @@
 import { Worker, Job } from 'bullmq';
 import IORedis from 'ioredis';
-import axios from 'axios';
 import { ProvisionState } from '@prisma/client';
 import { config } from '../config';
 import { createChildLogger } from '../utils/logger';
 import { ProcessOtpJobData } from '../services/queue.service';
 import { provisionService } from '../services/provision.service';
 import { sessionService } from '../services/session.service';
-// import { dockerService } from '../services/docker.service'; // Not needed - snapshot disabled
+import { dockerService } from '../services/docker.service';
 import whatsappAutomationService from '../services/whatsapp-automation.service';
 
-const WORKER_VERSION = '3.87.0-ANDROID-13';
+const WORKER_VERSION = '3.2.3-french';
 const logger = createChildLogger('otp-worker');
 
 logger.info(`🚀 OTP Worker Version: ${WORKER_VERSION}`);
-
-// Helper function to broadcast WebSocket events via API
-async function broadcastEvent(event: string, data: any) {
-  try {
-    await axios.post(`http://wa-api:3000/provision/broadcast`, {
-      event,
-      data
-    });
-  } catch (error) {
-    logger.error({ error, event, data }, 'Échec de diffusion de l\'événement');
-  }
-}
 
 const connection = new IORedis(config.redis.url, {
   maxRetriesPerRequest: null,
@@ -60,15 +47,6 @@ async function processOtp(job: Job<ProcessOtpJobData>) {
           message,
           source: 'otp-injection',
         });
-        
-        // Broadcast log to frontend in real-time for Live Logs display
-        await broadcastEvent('session_log', {
-          sessionId: session.id,
-          message,
-          source: 'otp-injection',
-          level: 'info',
-          timestamp: new Date().toISOString(),
-        });
       } catch (e) {
         logger.warn({ error: e }, 'Failed to save log');
       }
@@ -99,7 +77,10 @@ async function processOtp(job: Job<ProcessOtpJobData>) {
     await saveLog('✅ Code SMS saisi et configuration du profil terminée !');
     await job.updateProgress(50);
 
-    // No need to wait - injectOtp already verifies WhatsApp activation
+    // Wait for activation signal from agent (handled via WebSocket events)
+    // For now, we'll wait a bit and check if the agent reports success
+    await sleep(20000); // 20 seconds
+
     await job.updateProgress(80);
 
     // If linkToWeb is enabled, proceed with QR scan
@@ -116,56 +97,63 @@ async function processOtp(job: Job<ProcessOtpJobData>) {
     await sessionService.activateSession(session.id);
     await saveLog('✅ Compte WhatsApp activé et prêt à l\'emploi');
     
+    // Move to TESTING_DEEPLINK state
+    await provisionService.updateProvisionState(provisionId, ProvisionState.TESTING_DEEPLINK);
     await saveLog(`✅ Version du Worker : ${WORKER_VERSION}`);
-    await saveLog('✅ Le compte WhatsApp est maintenant actif !');
-    
+    await saveLog('📤 Test d\'envoi de message via deeplink (pas de création de contact nécessaire)...');
     await job.updateProgress(90);
     
-    // TEST: Attempt to create a contact and send a test message
-    await saveLog('🧪 Test automatique: Création d\'un contact...');
+    const testPhoneNumber = '+972545879642';
+    const testMessage = 'Bonjour ! Ceci est un message test automatique du système d\'automation WhatsApp.';
+    
     try {
-      const contactSuccess = await whatsappAutomationService.createWhatsAppContact({
-        appiumPort: session.appiumPort!,
+      await whatsappAutomationService.sendMessage({
+        appiumPort: session.appiumPort,
         sessionId: session.id,
-        phoneNumber: '544463186', // Test number as requested
-        firstName: undefined, // Will generate random
-        lastName: undefined, // Will generate random
-        onLog: async (msg: string) => {
-          await saveLog(msg);
-        },
+        to: testPhoneNumber,
+        message: testMessage,
+        containerId: session.containerName || undefined,
       });
       
-      if (contactSuccess) {
-        await saveLog('✅ Contact créé et message de test envoyé avec succès !');
-      } else {
-        await saveLog('⚠️ La création du contact n\'a pas pu être complétée (voir logs ci-dessus)');
-      }
-    } catch (contactError: any) {
-      await saveLog(`⚠️ Échec du test de contact: ${contactError.message}`);
-      // Don't fail the whole job if contact creation fails - it's just a test
+      await saveLog(`✅ Message test envoyé avec succès via deeplink vers ${testPhoneNumber} !`);
+      logger.info({ provisionId, sessionId: session.id, to: testPhoneNumber }, 'Test message sent via deeplink');
+    } catch (msgError: any) {
+      logger.error({ error: msgError.message, provisionId, sessionId: session.id }, 'Failed to send test message via deeplink');
+      await saveLog(`⚠️ Échec d'envoi du message test : ${msgError.message}, mais la session est active`);
     }
-    
+
+    // Move to CREATING_SNAPSHOT state
+    await provisionService.updateProvisionState(provisionId, ProvisionState.CREATING_SNAPSHOT);
+    await saveLog('📸 Création du snapshot du profil WhatsApp...');
     await job.updateProgress(95);
 
-    // Mark as ACTIVE immediately
+    // Create snapshot AFTER sending message (Appium might die during snapshot)
+    const snapshotPath = `/data/snapshots/${session.id}.tar.gz`;
+    
+    try {
+      await dockerService.snapshotContainer(
+        session.containerId!,
+        snapshotPath
+      );
+      await sessionService.updateSessionSnapshot(session.id, snapshotPath);
+      await saveLog('✅ Snapshot créé avec succès');
+      logger.info({ provisionId, sessionId: session.id, snapshotPath }, 'Snapshot created');
+    } catch (snapshotError: any) {
+      logger.warn({ error: snapshotError.message, provisionId, sessionId: session.id }, 'Failed to create snapshot, continuing anyway');
+      await saveLog(`⚠️ Échec de création du snapshot : ${snapshotError.message}, mais on continue...`);
+    }
+
+    // Finally mark as ACTIVE
     await provisionService.updateProvisionState(provisionId, ProvisionState.ACTIVE);
     await saveLog('🎉 Le compte WhatsApp est maintenant entièrement actif et prêt à l\'emploi !');
-    
-    // CRITICAL: Update progress to 100 BEFORE returning to ensure job completion is signaled
     await job.updateProgress(100);
 
-    logger.info({ provisionId, sessionId: session.id, jobId: job.id }, '✅ OTP job completed successfully - account is active - RETURNING NOW');
-    
-    // Return result object - BullMQ will use this to signal completion
-    const result = { 
+    logger.info({ provisionId, sessionId: session.id }, 'OTP processing completed');
+
+    return { 
       success: true, 
       sessionId: session.id,
-      provisionId,
-      completed: true,
     };
-    
-    logger.info({ result, jobId: job.id }, 'OTP job returning result');
-    return result;
   } catch (error) {
     logger.error({ error, provisionId, requestId }, 'OTP processing failed');
     
@@ -179,7 +167,9 @@ async function processOtp(job: Job<ProcessOtpJobData>) {
   }
 }
 
-// Sleep function removed - no longer needed
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 // Create worker
 export const otpWorker = new Worker<ProcessOtpJobData>(
@@ -191,10 +181,8 @@ export const otpWorker = new Worker<ProcessOtpJobData>(
   }
 );
 
-otpWorker.on('completed', (job, result) => {
-  // DO NOT make this async - just log and return immediately
-  logger.info({ jobId: job.id, provisionId: job.data.provisionId, result }, 'OTP job completed successfully');
-  // NO message sending here - it will be triggered manually from frontend or API
+otpWorker.on('completed', (job) => {
+  logger.info({ jobId: job.id, provisionId: job.data.provisionId }, 'OTP job completed');
 });
 
 otpWorker.on('failed', (job, err) => {

@@ -41,8 +41,8 @@ export const config = {
   },
   
   emulator: {
-    image: process.env.EMULATOR_IMAGE || 'budtmo/docker-android:emulator_13.0',
-    baseVncPort: parseInt(process.env.EMULATOR_BASE_VNC_PORT || '5900', 10),
+    image: process.env.EMULATOR_IMAGE || 'budtmo/docker-android',
+    baseVncPort: parseInt(process.env.EMULATOR_BASE_VNC_PORT || '6080', 10),
     baseAppiumPort: parseInt(process.env.EMULATOR_BASE_APPIUM_PORT || '4723', 10),
     baseAdbPort: parseInt(process.env.EMULATOR_BASE_ADB_PORT || '5555', 10),
   },
@@ -74,7 +74,7 @@ export const config = {
   
   admin: {
     username: process.env.ADMIN_USERNAME || 'admin',
-    password: process.env.ADMIN_PASSWORD || 'Ss123456',
+    password: process.env.ADMIN_PASSWORD || 'change_this_password',
   },
   
   rateLimit: {

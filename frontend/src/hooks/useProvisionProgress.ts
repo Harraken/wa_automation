@@ -14,56 +14,70 @@ const initialSteps: ProgressStep[] = [
   {
     id: 'init',
     title: '1. Initialisation',
-    description: 'Configuration...',
+    description: 'Configuration de la demande de provisioning...',
     status: 'pending',
     progress: 0
   },
   {
     id: 'spawn_container',
-    title: '2. Conteneur Android',
-    description: 'Démarrage émulateur...',
+    title: '2. Création du Conteneur',
+    description: 'Création du conteneur Android émulateur...',
+    status: 'pending',
+    progress: 0
+  },
+  {
+    id: 'create_contact',
+    title: '3. Création du Contact',
+    description: 'Création du contact Android pour les tests WhatsApp...',
     status: 'pending',
     progress: 0
   },
   {
     id: 'launch_whatsapp',
-    title: '3. WhatsApp',
-    description: 'Lancement WhatsApp...',
+    title: '4. Lancement de WhatsApp',
+    description: 'Démarrage de l\'application WhatsApp...',
     status: 'pending',
     progress: 0
   },
   {
     id: 'buy_number',
-    title: '4. Achat Numéro',
-    description: 'Achat numéro SMS...',
+    title: '5. Achat du Numéro',
+    description: 'Achat du numéro de téléphone quand WhatsApp est prêt...',
     status: 'pending',
     progress: 0
   },
   {
     id: 'enter_phone',
-    title: '5. Soumission',
-    description: 'Saisie numéro...',
+    title: '6. Saisie du Numéro',
+    description: 'Soumission du numéro de téléphone à WhatsApp...',
     status: 'pending',
     progress: 0
   },
   {
     id: 'wait_otp',
-    title: '6. Réception SMS',
-    description: 'Attente code...',
+    title: '7. Attente du SMS',
+    description: 'Surveillance du code SMS entrant...',
     status: 'pending',
     progress: 0
   },
   {
     id: 'inject_otp',
-    title: '7. Validation',
-    description: 'Injection code...',
+    title: '8. Injection du Code',
+    description: 'Saisie du code SMS dans WhatsApp...',
+    status: 'pending',
+    progress: 0
+  },
+  {
+    id: 'setup_profile',
+    title: '9. Configuration du Profil',
+    description: 'Finalisation de la configuration du profil WhatsApp...',
     status: 'pending',
     progress: 0
   },
   {
     id: 'complete',
-    title: '8. Terminé',
-    description: 'Session active !',
+    title: '10. Terminé',
+    description: 'La session WhatsApp est prête !',
     status: 'pending',
     progress: 0
   }

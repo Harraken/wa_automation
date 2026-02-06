@@ -41,7 +41,15 @@ CMD ["npm", "start"]
 
 # Worker stage
 FROM node:18-alpine AS worker
-RUN apk add --no-cache openssl
+# Install Chromium for Puppeteer + openssl
+RUN apk add --no-cache \
+    openssl \
+    chromium \
+    nss \
+    freetype \
+    harfbuzz \
+    ca-certificates \
+    ttf-freefont
 WORKDIR /app
 COPY --from=dependencies /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
@@ -50,6 +58,9 @@ COPY package*.json ./
 COPY prisma ./prisma/
 
 ENV NODE_ENV=production
+# Tell Puppeteer to use the installed Chromium
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
 
 CMD ["node", "dist/worker.js"]
 

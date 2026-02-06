@@ -41,14 +41,18 @@ router.post('/create', async (req: Request, res: Response) => {
 
     logger.info({ sessionId, phoneNumber, firstName, lastName }, 'Creating WhatsApp contact via UI');
 
-    // Call the automation service
-    await whatsappAutomationService.createWhatsAppContact({
-      appiumPort: session.appiumPort,
-      sessionId: session.id,
-      phoneNumber,
-      firstName,
-      lastName,
-    });
+    // TODO: Implement createWhatsAppContact in automation service
+    // For now, this is a placeholder
+    logger.warn('createWhatsAppContact is not yet implemented');
+    
+    // Placeholder - in the future, implement the automation
+    // await whatsappAutomationService.createWhatsAppContact({
+    //   appiumPort: session.appiumPort,
+    //   sessionId: session.id,
+    //   phoneNumber,
+    //   firstName,
+    //   lastName,
+    // });
 
     logger.info({ sessionId, phoneNumber }, 'WhatsApp contact created successfully');
 

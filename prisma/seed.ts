@@ -22,6 +22,18 @@ async function main() {
   } else {
     console.log('Admin user already exists');
   }
+
+  // Seed learned click for NEXT button (coordinates from capture/automation logs: 540, 1656)
+  try {
+    await prisma.$executeRaw`
+      INSERT INTO learned_clicks (id, button_type, x, y, success_count, last_used, created_at, updated_at)
+      VALUES (gen_random_uuid()::text, 'NEXT', 540, 1656, 1, NOW(), NOW(), NOW())
+      ON CONFLICT (button_type) DO UPDATE SET x = 540, y = 1656, updated_at = NOW()
+    `;
+    console.log('NEXT button coordinates (540, 1656) seeded for automation');
+  } catch {
+    // Table or columns may differ
+  }
 }
 
 main()
